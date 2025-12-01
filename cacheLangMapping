@@ -1,0 +1,24 @@
+function cacheLangMapping() {
+  const fileId = '1JHFCWOj4A82dSNeLHb68B5JHHPxfvHHxg8_e4tjjQtY'; // ID управляющего файла
+  const sheet = SpreadsheetApp.openById(fileId).getSheetByName('lang_mapping');
+  const data = sheet.getDataRange().getValues();
+
+  const headerMap = {};
+  const valueMap = {};
+
+  data.forEach(([type, rus, eng]) => {
+    if (!type || !rus || !eng) return;
+
+    if (type === 'header') {
+      headerMap[eng] = rus;
+    } else if (type === 'value') {
+      valueMap[eng] = rus;
+    }
+  });
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('header_map_eng_to_rus', JSON.stringify(headerMap));
+  props.setProperty('value_map_eng_to_rus', JSON.stringify(valueMap));
+
+  Logger.log('✅ Маппинг загружен и закеширован.');
+}
