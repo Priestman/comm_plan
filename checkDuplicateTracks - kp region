@@ -1,0 +1,103 @@
+function checkDuplicateTracks() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const timeZone = Session.getScriptTimeZone();
+  const now = new Date();
+  now.setHours(12, 0, 0, 0);
+
+  const currentMonth = Utilities.formatDate(now, timeZone, "MMMM_yyyy");
+
+  const prevDate = new Date(now);
+  prevDate.setMonth(prevDate.getMonth() - 1);
+  const previousMonth = Utilities.formatDate(prevDate, timeZone, "MMMM_yyyy");
+
+  const nextDate = new Date(now);
+  nextDate.setMonth(nextDate.getMonth() + 1);
+  const nextMonth = Utilities.formatDate(nextDate, timeZone, "MMMM_yyyy");
+
+  const monthsToCheck = [previousMonth, currentMonth, nextMonth];
+  const validSheetPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/;
+
+  const allTracks = new Map();
+
+  // 🔹 Загружаем все треки за 3 месяца
+  monthsToCheck.forEach(month => {
+    const sheet = spreadsheet.getSheetByName(month);
+    if (!sheet || !validSheetPattern.test(sheet.getName())) return;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const trackCol = headers.indexOf("Трек") + 1;
+    const statusCol = headers.indexOf("Статус рассылки") + 1;
+    if (trackCol < 1 || statusCol < 1) return;
+
+    const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+    const statusValues = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
+
+    trackValues.forEach((row, idx) => {
+      const track = row[0]?.toString().trim();
+      const status = statusValues[idx][0]?.toString().trim();
+
+      if (!track) return;
+      if (status === "Отменена" || status === "Не ушла") return;
+
+      const normalized = extractTrackId_dup(track);
+      if (!normalized) return;
+
+      const trackRow = idx + 2;
+      if (!allTracks.has(normalized)) allTracks.set(normalized, []);
+      allTracks.get(normalized).push({ month, trackRow });
+    });
+  });
+
+  // 🔹 Проверяем текущий лист
+  const sheet = spreadsheet.getSheetByName(currentMonth);
+  if (!sheet) return Logger.log("⚠ Не найден лист текущего месяца.");
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const trackCol = headers.indexOf("Трек") + 1;
+  const statusCol = headers.indexOf("Статус рассылки") + 1;
+  const correctnessCol = headers.indexOf("Корректность строки") + 1;
+
+  if (trackCol < 1 || statusCol < 1 || correctnessCol < 1) {
+    Logger.log("❌ Не найдены нужные столбцы.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+
+  const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+  const statusValues = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
+  const correctnessValues = sheet.getRange(2, correctnessCol, lastRow - 1, 1).getValues();
+
+  for (let i = 0; i < trackValues.length; i++) {
+    const rawTrack = trackValues[i][0]?.toString().trim();
+    const status = statusValues[i][0]?.toString().trim();
+
+    if (!rawTrack || status === "Отменена" || status === "Не ушла") continue;
+
+    const normalized = extractTrackId_dup(rawTrack);
+    const currentRow = i + 2;
+
+    if (normalized) {
+      const matches = allTracks.get(normalized)?.filter(entry => entry.month !== currentMonth || entry.trackRow !== currentRow);
+
+      if (matches?.length > 0) {
+        const duplicates = matches.map(m => `${m.month} (строка ${m.trackRow})`).join(", ");
+        correctnessValues[i][0] = `❌ Дублирующийся трек в ${duplicates}`;
+      }
+      // ❗ Если дублей нет — correctness не трогаем
+    }
+  }
+
+  sheet.getRange(2, correctnessCol, lastRow - 1, 1).setValues(correctnessValues);
+  Logger.log("✅ Проверка треков завершена.");
+}
+
+function extractTrackId_dup(track) {
+  if (!track) return "";
+  const match = track.match(/(?:\?|&)trid=([^&]+)/);
+  return match ? match[1].trim() : track.trim();
+}
