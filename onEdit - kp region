@@ -1,0 +1,575 @@
+function onEdit(e) {
+    var sheet = e.source.getActiveSheet();
+    var sheetName = sheet.getName();
+
+    // Проверяем, соответствует ли название листа формату "Месяц_Год"
+    var monthYearPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/;
+    if (!monthYearPattern.test(sheetName)) return;
+
+    var timeZone = Session.getScriptTimeZone();
+
+    // Определяем текущий, предыдущий и следующий месяц, избегая ошибок с setMonth()
+var timeZone = Session.getScriptTimeZone();
+var today = new Date();
+var currentMonth = Utilities.formatDate(today, timeZone, "MMMM_yyyy");
+
+var nextMonthDate = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+var nextMonth = Utilities.formatDate(nextMonthDate, timeZone, "MMMM_yyyy");
+var previousMonthDate = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+var previousMonth = Utilities.formatDate(previousMonthDate, timeZone, "MMMM_yyyy");
+
+if (![currentMonth, nextMonth].includes(sheetName)) return;
+
+    var range = e.range;
+    var row = range.getRow();
+    var column = range.getColumn();
+
+    // Если редактируется первая строка (заголовки) — защищаем их
+    if (row === 1) {
+        protectHeaders(e);
+        return;
+    }
+
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    var statusCol = headers.indexOf("Статус рассылки") + 1;
+    var trackCol = headers.indexOf("Трек") + 1;
+
+    var geoCol = headers.indexOf("ГЕО") + 1;
+    var mirrorCol = headers.indexOf("Зеркало") + 1;
+    var dateCol = headers.indexOf("Дата") + 1;
+    var dayOfWeekCol = headers.indexOf("День недели") + 1;
+    var pathCol = headers.indexOf("Путь") + 1;
+    var linkTrackCol = headers.indexOf("Ссылка + трек") + 1;
+    var refTimeCol = headers.indexOf("Время отправки по МСК") + 1;
+    var geoNCol = headers.indexOf("ГЕО_N") + 1;
+    var channelNCol = headers.indexOf("Канал_N") + 1;
+    var timeNCol = headers.indexOf("Время_N") + 1;
+    var refChannelCol = headers.indexOf("Канал") + 1;
+    var idCol = headers.indexOf("communication_id") + 1;
+
+    
+    if ([statusCol, trackCol].includes(column)) {
+        validateUniqueTrack(e, headers, [previousMonth, currentMonth, nextMonth]);
+    }
+        // Обрабатываем обновление "Зеркало" при изменении "ГЕО"
+      if (geoCol > 0 && mirrorCol > 0 && ([geoCol].includes(column) || range.getNumRows() > 1)) {
+                  updateMirrorColumn(sheet, range, geoCol, mirrorCol);
+      }  
+
+        // Вызываем обновление "День недели", если изменена "Дата"
+    if (column === dateCol && dayOfWeekCol > 0) {
+        updateDayOfWeek(sheet, range, dayOfWeekCol);
+    }
+
+        if ([mirrorCol, pathCol, trackCol].includes(column) && linkTrackCol > 0) {
+        updateLinkAndTrack(sheet, range, mirrorCol, pathCol, trackCol, linkTrackCol);
+    }
+
+    // Вызываем проверки и очистку статуса
+    clearStatusOnEdit(sheet, row, headers);
+    validateDateAndDay(e, headers);
+    validateGeo(e, headers);
+    validatePathAndTrack(e, headers);
+    validateNotificationType(e, headers);
+    validateProcessLable(e, headers);
+   // checkAndResetDuplicatedTransferredIds(e, headers);
+}
+
+
+function validateDateAndDay(e, headers) {
+    var sheet = e.source.getActiveSheet();
+    var sheetName = sheet.getName(); // Получаем название листа
+    var range = e.range;
+    var column = range.getColumn();
+    var row = range.getRow();
+
+    var dateCol = headers.indexOf("Дата") + 1;
+    var dayOfWeekCol = headers.indexOf("День недели") + 1;
+
+    if (column !== dateCol) return;
+
+    var dateValue = range.getValue();
+
+    if (Object.prototype.toString.call(dateValue) === "[object Date]") {
+        var daysShort = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+        var dayShort = daysShort[dateValue.getDay()];
+        sheet.getRange(row, dayOfWeekCol).setValue(dayShort); // Автозаполнение "День недели"
+
+        // Проверка: входит ли дата в текущий месяц
+        var formattedMonth = Utilities.formatDate(dateValue, Session.getScriptTimeZone(), "MMMM_yyyy");
+        if (formattedMonth !== sheetName) {
+            range.setBackground("#FFCDD2");
+            range.setNote("Ошибка: дата должна быть в пределах " + sheetName);
+        } else {
+            range.setBackground(null);
+            range.setNote("");
+        }
+    } else {
+        sheet.getRange(row, dayOfWeekCol).setValue(""); // Если дата удалена – очищаем "День недели"
+    }
+}
+
+
+function validateGeo(e, headers) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var column = range.getColumn();
+    var row = range.getRow();
+
+    var geoCol = headers.indexOf("ГЕО") + 1;
+    if (column !== geoCol) return;
+
+    var scriptProperties = PropertiesService.getScriptProperties();
+    var geoDataJson = scriptProperties.getProperty("geo_list_data");
+
+    if (!geoDataJson) {
+        Logger.log("⚠ geo_list_data не загружен.");
+        return;
+    }
+
+    var geoData = JSON.parse(geoDataJson);
+    var allowedGeo = new Set(geoData.allowedGeo);
+    var geoGroups = geoData.geoGroups;
+
+    var cellValue = range.getValue().trim();
+    if (!cellValue) return;
+
+    var geoValues = cellValue.split(",").map(s => s.trim());
+    var isValid = true;
+    var invalidValues = [];
+
+    geoValues.forEach(value => {
+        if (value === "ALL") {
+            if (geoValues.length > 1) {
+                isValid = false;
+                invalidValues.push(value + " (должно быть единственным значением)");
+            }
+        } else if (!allowedGeo.has(value) && !geoGroups[value]) {
+            isValid = false;
+            invalidValues.push(value);
+        }
+    });
+
+    if (!isValid) {
+        range.setBackground("#FFCDD2");
+        range.setNote("Ошибка: вы ввели новое значение (нет в массиве для КП) или неверные ГЕО → " + invalidValues.join(", "));
+    } else {
+        range.setBackground(null);
+        range.setNote("");
+    }
+}
+
+
+function validatePathAndTrack(e, headers) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var column = range.getColumn();
+    var startRow = range.getRow();
+    var numRows = range.getNumRows();
+
+    var pathCol = headers.indexOf("Путь") + 1;
+    var trackCol = headers.indexOf("Трек") + 1;
+
+    if (column !== pathCol && column !== trackCol) return; // Проверяем, что менялся "Путь" или "Трек"
+
+    // Загружаем все данные разом
+    var pathValues = sheet.getRange(startRow, pathCol, numRows, 1).getValues();
+    var trackValues = sheet.getRange(startRow, trackCol, numRows, 1).getValues();
+
+    var updatedTrackValues = [];
+    var needsUpdate = false;
+
+    for (var i = 0; i < numRows; i++) {
+        var pathValue = pathValues[i][0] ? pathValues[i][0].toString().trim() : "";
+        var trackValue = trackValues[i][0] ? trackValues[i][0].toString().trim() : "";
+
+        if (!trackValue) {
+            updatedTrackValues.push([trackValue]); // Оставляем пустым, если "Трек" не заполнен
+            continue;
+        }
+
+        var expectedStart = pathValue.includes("?") ? "&" : "?";
+
+        if (!trackValue.startsWith(expectedStart)) {
+            needsUpdate = true;
+            trackValue = expectedStart + trackValue.replace(/^[&?]/, ""); // Исправляем первый символ
+        }
+
+        updatedTrackValues.push([trackValue]);
+    }
+
+    // Если были изменения, обновляем одним вызовом setValues()
+    if (needsUpdate) {
+        sheet.getRange(startRow, trackCol, numRows, 1).setValues(updatedTrackValues);
+    }
+}
+
+
+function validateNotificationType(e, headers) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var row = range.getRow();
+    var column = range.getColumn();
+  
+    var channelCol = headers.indexOf("Канал") + 1;
+    var notifTypeCol = headers.indexOf("Тип нотифа") + 1;
+
+    if (channelCol < 1 || notifTypeCol < 1) return; // Проверяем, что столбцы существуют
+    if (![channelCol, notifTypeCol].includes(column)) return; // Проверяем только изменения в этих колонках
+
+    var rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var channelValue = rowData[channelCol - 1]?.trim();
+    var notifTypeCell = sheet.getRange(row, notifTypeCol);
+    var notifTypeValue = notifTypeCell.getValue()?.trim();
+
+    if (channelValue === "Notification") {
+        if (!notifTypeValue) {
+            notifTypeCell.setBackground("#FFCDD2"); // Подсвечиваем красным
+            notifTypeCell.setNote("❌ Ошибка: поле обязательно для Notification");
+        } else {
+            notifTypeCell.setBackground(null); // Убираем подсветку ошибки
+            notifTypeCell.setNote("");
+        }
+    } else {
+        if (notifTypeValue) {
+            notifTypeCell.setValue(""); // Очищаем значение
+        }
+        notifTypeCell.setBackground(null); // Сбрасываем фон
+        notifTypeCell.setNote(""); // Очищаем комментарий
+    }
+}
+
+function protectHeaders(e) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var row = range.getRow();
+
+    if (row !== 1) return; // Проверяем только первую строку (заголовки)
+
+    var protectedHeaders = [
+        "communication_id", "Дата", "День недели", "Статус рассылки", "Время отправки по МСК", 
+        "Канал", "Направление", "Тема рассылки", "ГЕО", "ГЕО переводы", "Группа сегментов", 
+        "Подсегмент", "Тесты", "Тип нотифа", "Путь", "Трек","Название сегмента в CDP", "process_lable", "Время отправки по МСК", 
+        "Ссылка + трек", "Зеркало", "Путь"
+    ];
+
+    var headersRange = sheet.getRange(1, 1, 1, sheet.getLastColumn());
+    var currentHeaders = headersRange.getValues()[0]; // Берём текущие заголовки
+    var oldHeaders = JSON.parse(PropertiesService.getScriptProperties().getProperty("saved_headers") || "{}");
+
+    var column = range.getColumn();
+    var newValue = range.getValue().trim();
+    var oldValue = oldHeaders[column] || "";
+
+    if (protectedHeaders.includes(oldValue) && newValue !== oldValue) {
+        Browser.msgBox("⚠️ Ошибка: '" + oldValue + "' нельзя переименовывать.");
+        sheet.getRange(1, column).setValue(oldValue); // Восстанавливаем название
+    }
+
+    // Сохраняем актуальные заголовки (если всё хорошо)
+    var updatedHeaders = {};
+    for (var i = 0; i < currentHeaders.length; i++) {
+        if (currentHeaders[i]) { // Сохраняем только существующие заголовки
+            updatedHeaders[i + 1] = currentHeaders[i].trim();
+        }
+    }
+    PropertiesService.getScriptProperties().setProperty("saved_headers", JSON.stringify(updatedHeaders));
+}
+
+function validateProcessLable(e, headers) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var row = range.getRow();
+    var column = range.getColumn();
+
+    var channelCol = headers.indexOf("Канал") + 1;
+    var processLabelCol = headers.indexOf("process_lable") + 1;
+
+    if (channelCol < 1 || processLabelCol < 1) return;
+    if (![channelCol, processLabelCol].includes(column)) return; // Проверяем только изменения в этих колонках
+
+    var channelValue = sheet.getRange(row, channelCol).getValue().toString().trim();
+    var processLabelCell = sheet.getRange(row, processLabelCol);
+    var processLabelValue = processLabelCell.getValue().toString().trim();
+
+    // Список каналов, для которых process_lable обязателен (включаем KakaoTalk)
+    var requiredProcessLabelChannels = ["Whatsapp", "SMS", "WA/TG/SMS", "Viber", "KakaoTalk"];
+
+    if (requiredProcessLabelChannels.includes(channelValue) && !processLabelValue) {
+        // Обязателен, но не заполнен
+        processLabelCell.setBackground("#FFCDD2");
+        processLabelCell.setNote("❌ Ошибка: 'process_lable' обязателен для " + channelValue);
+    } else if (!requiredProcessLabelChannels.includes(channelValue) && processLabelValue) {
+        // Не требуется, но заполнен
+        processLabelCell.setBackground("#FFCDD2");
+        processLabelCell.setNote("❌ Ошибка: 'process_lable' должно быть пустым для " + channelValue);
+    } else {
+        // Все хорошо (заполнен, когда нужно, или пустой, когда не нужно)
+        processLabelCell.setBackground(null);
+        processLabelCell.setNote(""); 
+    }
+}
+
+function clearStatusOnEdit(sheet, row, headers) {
+    var statusCol = headers.indexOf("Корректность строки") + 1;
+    if (statusCol < 1) return; // Если нет столбца, выходим
+
+    var statusCell = sheet.getRange(row, statusCol);
+    var statusValue = statusCell.getValue().toString().trim();
+
+    if (statusValue && statusValue !== "Перенесено в БД") {
+        statusCell.setValue(""); // Очищаем статус, если он не "Перенесено в БД"
+    }
+}
+
+function validateUniqueTrack(e, headers, months) {
+    var sheet = e.source.getActiveSheet();
+    var range = e.range;
+    var row = range.getRow();
+
+    var statusCol = headers.indexOf("Статус рассылки") + 1;
+    var trackCol = headers.indexOf("Трек") + 1;
+
+    if (trackCol < 1 || statusCol < 1) return;
+
+    var statusValue = sheet.getRange(row, statusCol).getValue();
+    var trackValue = sheet.getRange(row, trackCol).getValue().trim();
+
+    if (!trackValue ) return;
+
+    function extractTrackId(track) {
+        if (!track) return "";
+        var match = track.match(/=(.+)$/);
+        return match ? match[1].trim() : track.trim();
+    }
+
+    var normalizedTrack = extractTrackId(trackValue);
+    var spreadsheet = sheet.getParent();
+    var allTracks = new Map(); // Используем Map для хранения {трек: количество вхождений}
+
+    Logger.log("🔍 Проверка трека: " + trackValue + " → нормализованный: " + normalizedTrack);
+
+    months.forEach(month => {
+        var sheetByMonth = spreadsheet.getSheetByName(month);
+        if (sheetByMonth) {
+            var lastRow = sheetByMonth.getLastRow();
+            Logger.log("📄 Лист: " + month + " | Последняя строка: " + lastRow);
+
+            if (lastRow > 1) {
+                var rangeValues = sheetByMonth.getRange(2, trackCol, lastRow - 1, 1).getValues();
+
+                rangeValues.flat().forEach((track, index) => {
+                    if (track) {
+                        var normalized = extractTrackId(track.toString());
+
+                        // Проверяем, не наша ли это строка
+                        var trackRow = index + 2; // +2, потому что данные начинаются со 2-й строки
+                        if (month === sheet.getName() && trackRow === row) return; 
+
+                        // Добавляем трек в Map, увеличивая счетчик
+                        allTracks.set(normalized, (allTracks.get(normalized) || 0) + 1);
+                    }
+                });
+
+                Logger.log("📌 Треки на листе " + month + ": " + JSON.stringify([...allTracks]));
+            }
+        } else {
+            Logger.log("⚠ Лист '" + month + "' не найден.");
+        }
+    });
+
+    Logger.log("✅ Финальный список треков для сравнения: " + JSON.stringify([...allTracks]));
+
+    var trackCell = sheet.getRange(row, trackCol);
+
+    if (allTracks.has(normalizedTrack)) {
+        Logger.log("❌ Найден дубликат трека: " + normalizedTrack);
+        trackCell.setBackground("#FFCDD2");
+        trackCell.setNote("Ошибка: дублирующийся трек в одном из месяцев.");
+    } else {
+        Logger.log("✅ Трек уникальный: " + normalizedTrack);
+        trackCell.setBackground(null);
+        trackCell.setNote("");
+    }
+}
+
+function updateMirrorColumn(sheet, range, geoCol, mirrorCol) {
+  const numRows = range.getNumRows();
+  const startRow = range.getRow();
+
+  const geoValues = sheet.getRange(startRow, geoCol, numRows, 1).getValues();
+  const currentMirrorValues = sheet.getRange(startRow, mirrorCol, numRows, 1).getValues();
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const channelCol = headers.indexOf("Канал") + 1;
+  const pathCol = headers.indexOf("Путь") + 1;
+  const autoMirrorCol = headers.indexOf("auto_mirror") + 1;
+
+  const channelValues = channelCol > 0
+    ? sheet.getRange(startRow, channelCol, numRows, 1).getValues()
+    : Array(numRows).fill(['']);
+  const pathValues = pathCol > 0
+    ? sheet.getRange(startRow, pathCol, numRows, 1).getValues()
+    : Array(numRows).fill(['']);
+  const autoMirrorValues = autoMirrorCol > 0
+    ? sheet.getRange(startRow, autoMirrorCol, numRows, 1).getValues()
+    : Array(numRows).fill([false]);
+
+  const cachedMirrors = getCachedMirrors();
+  const outputValues = [];
+
+  for (let i = 0; i < numRows; i++) {
+    const autoMirror = autoMirrorValues[i][0] === true;
+    const geoValue = geoValues[i][0]?.toString().trim() || "";
+    const mirrorValue = currentMirrorValues[i][0]?.toString().trim() || "";
+
+    let newMirror = mirrorValue;
+
+    if (autoMirror) {
+      if (!geoValue || geoValue.includes(",")) {
+        newMirror = "";
+      } else {
+        newMirror = cachedMirrors[geoValue] || "";
+      }
+    }
+
+    outputValues.push([newMirror]);
+  }
+
+  sheet.getRange(startRow, mirrorCol, outputValues.length, 1).setValues(outputValues);
+}
+
+
+
+
+
+
+// 📌 Загружаем кэшированные данные зеркал
+function getCachedMirrors() {
+    var cachedData = PropertiesService.getScriptProperties().getProperty("geo_mirror_cache");
+    if (!cachedData) return {};
+
+    return JSON.parse(cachedData);
+}
+
+
+
+
+function updateDayOfWeek(sheet, range, dayOfWeekCol) {
+    var editedValues = range.getValues(); // Получаем массив значений
+    var outputValues = [];
+    
+    var daysShort = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+
+    for (var i = 0; i < editedValues.length; i++) {
+        var dateValue = editedValues[i][0];
+
+        if (Object.prototype.toString.call(dateValue) === "[object Date]") {
+            var dayShort = daysShort[dateValue.getDay()];
+            outputValues.push([dayShort]); // Добавляем день недели
+        } else {
+            outputValues.push([""]); // Если дата удалена – очищаем "День недели"
+        }
+    }
+
+    // Записываем все значения разом
+    sheet.getRange(range.getRow(), dayOfWeekCol, outputValues.length, 1).setValues(outputValues);
+}
+
+function updateLinkAndTrack(sheet, range, mirrorCol, pathCol, trackCol, linkTrackCol) {
+    var numRows = range.getNumRows();
+    var startRow = range.getRow();
+
+    // Загружаем все данные одним запросом (оптимизация)
+    var mirrorValues = sheet.getRange(startRow, mirrorCol, numRows, 1).getValues();
+    var pathValues = sheet.getRange(startRow, pathCol, numRows, 1).getValues();
+    var trackValues = sheet.getRange(startRow, trackCol, numRows, 1).getValues();
+    var existingLinkValues = sheet.getRange(startRow, linkTrackCol, numRows, 1).getValues();
+
+    var outputValues = [];
+    var needsUpdate = false;
+
+    for (var i = 0; i < numRows; i++) {
+        var mirror = mirrorValues[i][0] ? mirrorValues[i][0].toString().trim() : "";
+        var path = pathValues[i][0] ? pathValues[i][0].toString().trim() : "";
+        var track = trackValues[i][0] ? trackValues[i][0].toString().trim() : "";
+
+        // 🔹 Формируем "Ссылка + трек" по логике формулы
+        var newLinkTrack = (mirror ? mirror : "") + path + track;
+
+        // 🔹 Проверяем, изменилось ли значение
+        if (newLinkTrack !== existingLinkValues[i][0]) {
+            outputValues.push([newLinkTrack]);
+            needsUpdate = true;
+        } else {
+            outputValues.push([existingLinkValues[i][0]]); // Оставляем прежнее значение
+        }
+    }
+
+    // 🔹 Оптимизация: обновляем только если есть изменения
+    if (needsUpdate) {
+        sheet.getRange(startRow, linkTrackCol, outputValues.length, 1).setValues(outputValues);
+    }
+}
+
+
+
+function updateDuplicateColumns(sheet, row, refGeoCol, refChannelCol, refTimeCol, geoNCol, channelNCol, timeNCol) {
+    var refGeo = sheet.getRange(row, refGeoCol).getValue();
+    var refChannel = sheet.getRange(row, refChannelCol).getValue();
+    var refTime = sheet.getRange(row, refTimeCol).getValue();
+
+    if (geoNCol > 0) sheet.getRange(row, geoNCol).setValue(refGeo);
+    if (channelNCol > 0) sheet.getRange(row, channelNCol).setValue(refChannel);
+    if (timeNCol > 0) sheet.getRange(row, timeNCol).setValue(refTime);
+}
+
+function checkAndResetDuplicatedTransferredIds(e, headers) {
+  const sheet = e.range.getSheet();
+  const sheetName = sheet.getName();
+  const range = e.range;
+  const numRows = range.getNumRows();
+  const startRow = range.getRow();
+
+  const idCol = headers.indexOf("communication_id") + 1;
+  const statusCol = headers.indexOf("Корректность строки") + 1;
+  const trackCol = headers.indexOf("Трек") + 1;
+  if (idCol < 1 || statusCol < 1 || trackCol < 1) return;
+
+  const cacheRaw = PropertiesService.getScriptProperties().getProperty(`clean_ids_${sheetName}`);
+  if (!cacheRaw) return;
+
+  const cache = JSON.parse(cacheRaw);
+  const idValues = sheet.getRange(startRow, idCol, numRows, 1).getValues();
+  const statusValues = sheet.getRange(startRow, statusCol, numRows, 1).getValues();
+  const trackValues = sheet.getRange(startRow, trackCol, numRows, 1).getValues();
+
+  const clearedRows = [];
+
+  for (let i = 0; i < numRows; i++) {
+    const id = idValues[i][0]?.toString().trim();
+    const status = statusValues[i][0]?.toString().trim();
+    const track = extractTrackId(trackValues[i][0]);
+
+    const cached = cache[id];
+    if (!id || status !== "Перенесено в БД" || !cached) continue;
+
+    if (cached.track === track) {
+      clearedRows.push(i);
+    }
+  }
+
+  if (clearedRows.length === 0) return;
+
+  const emptyValues = clearedRows.map(() => [""]);
+  sheet.getRange(startRow + clearedRows[0], idCol, clearedRows.length, 1).setValues(emptyValues);
+  sheet.getRange(startRow + clearedRows[0], statusCol, clearedRows.length, 1).setValues(emptyValues);
+}
+
+function extractTrackId(rawTrack) {
+  if (!rawTrack) return "";
+  const match = rawTrack.match(/(?:\?|&)trid=([^&]+)/);
+  return match ? match[1].trim() : rawTrack.trim();
+}
+
