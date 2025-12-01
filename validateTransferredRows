@@ -1,0 +1,57 @@
+function validateTransferredRows(kpName) {
+  const kps = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден в ScriptProperties.`);
+
+  const currentMonth = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM_yyyy");
+
+  const workSheet = SpreadsheetApp.openById(kp.id_work).getSheetByName(currentMonth);
+  const cleanSheet = SpreadsheetApp.openById(kp.id_clean).getSheetByName(currentMonth);
+  if (!workSheet || !cleanSheet) {
+    Logger.log(`❌ Не найдены листы '${currentMonth}' в одном из файлов для КП '${kpName}'`);
+    return;
+  }
+
+  const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+  const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+
+  const idColWork = workHeaders.indexOf("communication_id");
+  const statusCol = workHeaders.indexOf("Статус рассылки");
+  const correctnessCol = workHeaders.indexOf("Корректность строки");
+
+  const idColClean = cleanHeaders.indexOf("communication_id");
+
+  if ([idColWork, statusCol, correctnessCol, idColClean].includes(-1)) {
+    Logger.log("❌ Отсутствуют ключевые столбцы в одном из файлов.");
+    return;
+  }
+
+  const workData = workSheet.getRange(2, 1, workSheet.getLastRow() - 1, workSheet.getLastColumn()).getValues();
+  const cleanData = cleanSheet.getRange(2, 1, cleanSheet.getLastRow() - 1, cleanSheet.getLastColumn()).getValues();
+
+  const cleanIdSet = new Set(cleanData.map(row => row[idColClean]?.toString().trim()));
+  let missing = 0;
+
+  workData.forEach((row, i) => {
+    const commId = row[idColWork]?.toString().trim();
+    const status = row[statusCol]?.toString().trim();
+    const correctness = row[correctnessCol]?.toString().trim();
+
+    if (status === "Выполнена" && correctness === "Перенесено в БД") {
+      if (!commId || !cleanIdSet.has(commId)) {
+        Logger.log(`❌ Строка ${i + 2} → ID '${commId}' отсутствует в чистовом файле`);
+        missing++;
+      }
+    }
+  });
+
+  if (missing === 0) {
+    Logger.log("✅ Все communication_id с 'Перенесено в БД' найдены в чистовом.");
+  } else {
+    Logger.log(`⚠️ Найдено несовпадений: ${missing}`);
+  }
+}
+
+function checkKPtransfer_TEST() {
+  validateTransferredRows("TEST");
+}
