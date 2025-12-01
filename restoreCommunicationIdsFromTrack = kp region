@@ -1,0 +1,69 @@
+function restoreCommunicationIdsFromTrack(kpName) {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const kps = JSON.parse(scriptProps.getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден.`);
+
+  const month = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM_yyyy");
+  const cacheRaw = scriptProps.getProperty(`clean_ids_${month}`);
+  if (!cacheRaw) return Logger.log(`⚠ Нет кэша clean_ids_${month}`);
+
+  const enrichedCache = JSON.parse(cacheRaw);
+  const trackToIdMap = {};
+  for (const [id, obj] of Object.entries(enrichedCache)) {
+    if (obj.track) trackToIdMap[obj.track.trim()] = id;
+  }
+
+  const file = SpreadsheetApp.openById(kp.id_work);
+  const sheet = file.getSheetByName(month);
+  if (!sheet) return Logger.log(`⚠ Лист '${month}' не найден в файле ${kpName}`);
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+
+  const idCol = headers.indexOf("communication_id");
+  const trackCol = headers.indexOf("Трек");
+  const correctnessCol = headers.indexOf("Корректность строки");
+  const statusCol = headers.indexOf("Статус рассылки");
+
+  if (idCol === -1 || trackCol === -1 || correctnessCol === -1 || statusCol === -1) {
+    return Logger.log(`❌ Нет нужных колонок в ${kpName}`);
+  }
+
+  let restoredCount = 0;
+  const idUpdates = [];
+  const correctnessUpdates = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const id = row[idCol];
+    const track = row[trackCol]?.toString().trim();
+    const correctness = row[correctnessCol]?.toString().trim();
+    const status = row[statusCol]?.toString().trim();
+
+    if (!track || !trackToIdMap[track]) continue;
+
+    const cachedId = trackToIdMap[track];
+
+    if (!id) {
+      // Восстанавливаем ID и статус
+      idUpdates.push({ row: i + 1, value: cachedId });
+      correctnessUpdates.push({ row: i + 1, value: "Перенесено в БД" });
+      restoredCount++;
+    } else if (id === cachedId && correctness !== "Перенесено в БД") {
+      correctnessUpdates.push({ row: i + 1, value: "Перенесено в БД" });
+      restoredCount++;
+    }
+  }
+
+  // Применение точечных обновлений
+  idUpdates.forEach(update => {
+    sheet.getRange(update.row, idCol + 1).setValue(update.value);
+  });
+  correctnessUpdates.forEach(update => {
+    sheet.getRange(update.row, correctnessCol + 1).setValue(update.value);
+  });
+
+  Logger.log(`✅ Восстановлено строк в ${kpName}: ${restoredCount}`);
+}
+
