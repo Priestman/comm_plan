@@ -1,0 +1,43 @@
+function loadActiveKPs_first() {
+
+    const cleanSheet = SpreadsheetApp.openById("1JHFCWOj4A82dSNeLHb68B5JHHPxfvHHxg8_e4tjjQtY");
+    var sheet = cleanSheet.getSheetByName("Sheet1"); // Убедись, что это правильное название листа
+    if (!sheet) {
+        Logger.log("⚠ Лист 'Sheet1' не найден!");
+        return;
+    }
+
+    var data = sheet.getDataRange().getValues(); // Загружаем все данные
+    var headers = data[0]; // Заголовки колонок
+    var nameIndex = headers.indexOf("name");
+    var idWorkIndex = headers.indexOf("id_work");
+    var idCleanIndex = headers.indexOf("id_clean");
+    var activeIndex = headers.indexOf("active");
+
+    if (nameIndex === -1 || idWorkIndex === -1 || idCleanIndex === -1 || activeIndex === -1) {
+        Logger.log("⚠ Одна из колонок отсутствует!");
+        return;
+    }
+
+    var kps = [];
+    for (var i = 1; i < data.length; i++) {
+        var name = data[i][nameIndex];
+        var idWork = data[i][idWorkIndex];
+        var idClean = data[i][idCleanIndex];
+        var isActive = data[i][activeIndex];
+
+        if (isActive === "YES" && name && idWork && idClean) {
+            kps.push({
+                name: name,
+                id_work: idWork,
+                id_clean: idClean
+            });
+        }
+    }
+
+    // Записываем в Script Properties
+    var scriptProperties = PropertiesService.getScriptProperties();
+    scriptProperties.setProperty("active_kps", JSON.stringify(kps));
+
+    Logger.log("✅ Загружено " + kps.length + " активных КП.");
+}
