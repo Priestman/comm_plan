@@ -1,0 +1,258 @@
+function updateKPFromMasterData() {
+  const MASTER_FILE_ID = '13mafABoV2ZRW8wazEMzcR8bTTWJ-5K7cYdwZruyUl5Y';
+  const MASTER_SHEET_NAME = 'Report (Short)';
+
+  const KP_FILE_IDS = [
+    '1WfslprOxh0UTQhkr1qjTRIEeTG56moyAlAK3NAnffrg',
+    '1yOC7lFlwFfXgthb5irjjoJt9tMY8bS7L4FE9Tn3-ESI',
+    '1J1pHccWNU9Sq3r7AY4DpermWjEwsYljBYSnD5Zcf2i0',
+    '1r07f6FGlwHjjaqiv1Ie5_C-Twh0e-LDFD9GHVjalm7k',
+    '1qqQmC2MwZ-jF7imqUoZ4aoPzlE1HnpJQmjU3s7qqG6s',
+    '1yKu2nuKGw5g9dsEKEhkxvWOEyAtWw1ExPM0O3xbY-bY',
+    '10HDQmTTd_WzCAgss6Yw3qvo3ZLzyY--OXI_mQkYqx8Y',
+    '1GYHa8LghjtRzhtYUpATYA2syCbQ8N5aNAq_dqzOcHyg',
+    '1onT8LJwo2z1gpkCYvA64rrzBf2T6iAjkQB-O4AH6de8',
+    '1WTBO6EXGYRg9twP2dD7_6ZRNYkER-fBsIBm3Wt_it0M'
+  ];
+
+  Logger.log("🚀 Запуск обновления КП из мастер-файла.");
+
+  const masterDataCache = loadMasterDataCache(MASTER_FILE_ID, MASTER_SHEET_NAME);
+
+  if (Object.keys(masterDataCache).length === 0) {
+    Logger.log("❌ Не удалось загрузить данные из мастер-файла или кэш пуст. Завершение работы.");
+    return;
+  }
+  Logger.log(`✅ Загружено ${Object.keys(masterDataCache).length} записей Trid из мастер-файла.`);
+
+  for (const kpFileId of KP_FILE_IDS) {
+    processKPFile(kpFileId, masterDataCache);
+  }
+
+  Logger.log("🎉 Обновление КП завершено.");
+}
+
+function loadMasterDataCache(fileId, sheetName) {
+  const cache = {};
+  try {
+    const spreadsheet = SpreadsheetApp.openById(fileId);
+    const sheet = spreadsheet.getSheetByName(sheetName);
+    if (!sheet) return cache;
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length < 2) return cache;
+
+    const headers = values[0];
+    const getColIndex = (headerName) => headers.indexOf(headerName);
+
+    const colTrid = getColIndex('Trid');
+    const colActualCalls = getColIndex('Actual Calls');
+    const colLinks = getColIndex('Links');
+    const colVisits = getColIndex('Visits');
+    const colExpenses = getColIndex('Expenses');
+    const colCostPerInterested = getColIndex('Cost per Interested');
+    const colCostPerClick = getColIndex('Cost per Click');
+
+    if ([colTrid, colActualCalls, colLinks, colVisits, colExpenses, colCostPerInterested, colCostPerClick].some(idx => idx === -1)) {
+      Logger.log(`❌ Ошибка: Не все необходимые колонки найдены в листе "${sheetName}" мастер-файла.`);
+      return cache;
+    }
+
+    for (let i = 1; i < values.length; i++) {
+      const row = values[i];
+      const trid = (row[colTrid] || '').toString().trim();
+
+      if (trid) {
+        cache[trid] = {
+          actualCalls: normalizeNumber_zvonobot(row[colActualCalls]),
+          links: normalizeNumber_zvonobot(row[colLinks]),
+          visits: normalizeNumber_zvonobot(row[colVisits]),
+          expenses: normalizeNumber_zvonobot(row[colExpenses]),
+          costPerInterested: normalizeNumber_zvonobot(row[colCostPerInterested]),
+          costPerClick: normalizeNumber_zvonobot(row[colCostPerClick])
+        };
+      }
+    }
+  } catch (e) {
+    Logger.log(`❌ Критическая ошибка при загрузке мастер-файла (ID: ${fileId}): ${e.message}`);
+  }
+  return cache;
+}
+
+function processKPFile(kpFileId, masterDataCache) {
+  try {
+    const spreadsheet = SpreadsheetApp.openById(kpFileId);
+    Logger.log(`📄 Обработка файла КП: ${spreadsheet.getName()}`);
+
+    const currentDate = new Date();
+    const currentMonth = currentDate.getMonth(); // 0-11
+    const currentYear = currentDate.getFullYear();
+
+    // Расчет предыдущего месяца и года
+    let previousMonth = currentMonth - 1;
+    let previousYear = currentYear;
+    if (previousMonth < 0) {
+      previousMonth = 11; // Декабрь
+      previousYear--;
+    }
+
+    const sheetsToProcess = spreadsheet.getSheets();
+
+    for (const sheet of sheetsToProcess) {
+      const sheetName = sheet.getName();
+      const parsed = parseSheetName_Zvonobot_(sheetName);
+
+      // Условие 1: Обновлять только прошлый и текущий месяц
+      if (!parsed ||
+          !( (parsed.year === currentYear && parsed.month === currentMonth) ||
+             (parsed.year === previousYear && parsed.month === previousMonth) ) )
+      {
+        Logger.log(`  ➡️ Пропуск листа "${sheetName}": не соответствует текущему или прошлому месяцу/году.`);
+        continue;
+      }
+
+      Logger.log(`  🔍 Обработка листа: ${sheetName}`);
+
+      const values = sheet.getDataRange().getValues();
+      if (values.length < 2) continue;
+
+      const headers = values[0];
+      const getColIndex = (headerName) => headers.indexOf(headerName);
+
+      const colTrack = getColIndex('Трек');
+      const colChannel = getColIndex('Канал');
+      const colStatus = getColIndex('Статус рассылки');
+      
+      const colActualCallsKP = getColIndex('Отправлено');
+      const colLinksKP = getColIndex('Доставлено');
+      const colVisitsKP = getColIndex('Прочитано');
+      const colExpensesKP = getColIndex('Спенд');
+      const colCostPerInterestedKP = getColIndex('Cost per Interested');
+      const colCostPerClickKP = getColIndex('Cost per Click');
+
+      if ([colTrack, colChannel, colStatus, colActualCallsKP, colLinksKP, colVisitsKP, colExpensesKP, colCostPerInterestedKP, colCostPerClickKP].some(idx => idx === -1)) {
+        Logger.log(`  ❌ Ошибка: Не все необходимые колонки найдены в листе "${sheetName}" файла КП.`);
+        continue;
+      }
+
+      const updates = [];
+      const startRow = 1;
+
+      for (let i = startRow; i < values.length; i++) {
+        const row = values[i];
+        const trackValue = (row[colTrack] || '').toString().trim();
+        const channelValue = (row[colChannel] || '').toString().trim();
+        const statusValue = (row[colStatus] || '').toString().trim();
+
+        if (trackValue &&
+            channelValue === 'Звонобот' &&
+            statusValue === 'Выполнена' &&
+            masterDataCache.hasOwnProperty(trackValue)) {
+
+          const masterRowData = masterDataCache[trackValue];
+
+          const newActualCalls = masterRowData.actualCalls.toString().replace('.', ',');
+          const newLinks = masterRowData.links.toString().replace('.', ',');
+          const newVisits = masterRowData.visits.toString().replace('.', ',');
+          const newExpenses = masterRowData.expenses.toFixed(3).replace('.', ',');
+          const newCostPerInterested = masterRowData.costPerInterested.toFixed(2).replace('.', ',');
+          const newCostPerClick = masterRowData.costPerClick.toFixed(2).replace('.', ',');
+
+          // Условие 2: Не перезаписывать, если значения совпадают
+          let shouldUpdate = false;
+          if (row[colActualCallsKP] != newActualCalls) shouldUpdate = true;
+          if (row[colLinksKP] != newLinks) shouldUpdate = true;
+          if (row[colVisitsKP] != newVisits) shouldUpdate = true;
+          if (row[colExpensesKP] != newExpenses) shouldUpdate = true;
+          if (row[colCostPerInterestedKP] != newCostPerInterested) shouldUpdate = true;
+          if (row[colCostPerClickKP] != newCostPerClick) shouldUpdate = true;
+
+          if (shouldUpdate) {
+            updates.push({
+              row: i + 1,
+              colActualCalls: colActualCallsKP + 1,
+              colLinks: colLinksKP + 1,
+              colVisits: colVisitsKP + 1,
+              colExpenses: colExpensesKP + 1,
+              colCostPerInterested: colCostPerInterestedKP + 1,
+              colCostPerClick: colCostPerClickKP + 1,
+              
+              actualCalls: newActualCalls,
+              links: newLinks,
+              visits: newVisits,
+              expenses: newExpenses,
+              costPerInterested: newCostPerInterested,
+              costPerClick: newCostPerClick
+            });
+          }
+        }
+      }
+
+      if (updates.length > 0) {
+        Logger.log(`    📊 Обновление ${updates.length} строк в листе "${sheet.getName()}"...`);
+        const batchUpdates = {};
+        for(const update of updates) {
+          if (!batchUpdates[update.colActualCalls]) batchUpdates[update.colActualCalls] = [];
+          if (!batchUpdates[update.colLinks]) batchUpdates[update.colLinks] = [];
+          if (!batchUpdates[update.colVisits]) batchUpdates[update.colVisits] = [];
+          if (!batchUpdates[update.colExpenses]) batchUpdates[update.colExpenses] = [];
+          if (!batchUpdates[update.colCostPerInterested]) batchUpdates[update.colCostPerInterested] = [];
+          if (!batchUpdates[update.colCostPerClick]) batchUpdates[update.colCostPerClick] = [];
+
+          batchUpdates[update.colActualCalls].push({row: update.row, value: update.actualCalls});
+          batchUpdates[update.colLinks].push({row: update.row, value: update.links});
+          batchUpdates[update.colVisits].push({row: update.row, value: update.visits});
+          batchUpdates[update.colExpenses].push({row: update.row, value: update.expenses});
+          batchUpdates[update.colCostPerInterested].push({row: update.row, value: update.costPerInterested});
+          batchUpdates[update.colCostPerClick].push({row: update.row, value: update.costPerClick});
+        }
+        
+        for (const colIndexStr in batchUpdates) {
+          const colIndex = parseInt(colIndexStr);
+          const updatesForCol = batchUpdates[colIndexStr].sort((a,b) => a.row - b.row);
+          
+          let currentBlockStartRow = updatesForCol[0].row;
+          let currentBlockValues = [[updatesForCol[0].value]];
+
+          for (let k = 1; k < updatesForCol.length; k++) {
+              if (updatesForCol[k].row === currentBlockStartRow + currentBlockValues.length) {
+                  currentBlockValues.push([updatesForCol[k].value]);
+              } else {
+                  sheet.getRange(currentBlockStartRow, colIndex, currentBlockValues.length, 1).setValues(currentBlockValues);
+                  currentBlockStartRow = updatesForCol[k].row;
+                  currentBlockValues = [[updatesForCol[k].value]];
+              }
+          }
+          sheet.getRange(currentBlockStartRow, colIndex, currentBlockValues.length, 1).setValues(currentBlockValues);
+        }
+        
+        Logger.log(`    ✅ Обновлено ${updates.length} строк в листе "${sheet.getName()}".`);
+      } else {
+        Logger.log(`    ℹ️ Нет подходящих строк для обновления в листе "${sheet.getName()}".`);
+      }
+    }
+  } catch (e) {
+    Logger.log(`❌ Ошибка при обработке файла КП (ID: ${kpFileId}): ${e.message}`);
+  }
+}
+
+function normalizeNumber_zvonobot(value) {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const cleanedValue = value.replace(/\$/g, '').replace(/\s/g, '').replace(',', '.');
+    const num = parseFloat(cleanedValue);
+    return isNaN(num) ? 0 : num;
+  }
+  return 0;
+}
+
+function parseSheetName_Zvonobot_(sheetName) {
+  const match = sheetName.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/);
+  if (!match) return null;
+  const months = {
+    "January": 0, "February": 1, "March": 2, "April": 3, "May": 4,
+    "June": 5, "July": 6, "August": 7, "September": 8,
+    "October": 9, "November": 10, "December": 11
+  };
+  return { month: months[match[1]], year: parseInt(match[2]) };
+}
