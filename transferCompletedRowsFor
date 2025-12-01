@@ -1,0 +1,193 @@
+function transferCompletedRowsFor(kpName) {
+  const kps = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден в ScriptProperties.`);
+
+  const sheetName = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM_yyyy");
+  const cachedIdsRaw = PropertiesService.getScriptProperties().getProperty(`clean_ids_${sheetName}`);
+  const cachedIds = new Set(cachedIdsRaw ? JSON.parse(cachedIdsRaw) : []);
+
+  try {
+    const workBook = SpreadsheetApp.openById(kp.id_work);
+    const cleanBook = SpreadsheetApp.openById(kp.id_clean);
+
+    const workSheet = workBook.getSheetByName(sheetName);
+    let cleanSheet = cleanBook.getSheetByName(sheetName);
+    if (!workSheet) return Logger.log(`⚠ Лист '${sheetName}' отсутствует в рабочем КП ${kpName}`);
+    if (!cleanSheet) cleanSheet = cleanBook.insertSheet(sheetName);
+
+    const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+    const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+
+    const statusCol = workHeaders.indexOf("Статус рассылки") + 1;
+    const correctnessCol = workHeaders.indexOf("Корректность строки") + 1;
+    const idCol = workHeaders.indexOf("communication_id") + 1;
+    if (statusCol < 1 || correctnessCol < 1 || idCol < 1) return;
+
+    const lastRow = workSheet.getLastRow();
+    if (lastRow < 2) return;
+
+    const data = workSheet.getRange(2, 1, lastRow - 1, workSheet.getLastColumn()).getValues();
+    const correctnessValues = workSheet.getRange(2, correctnessCol, lastRow - 1, 1).getValues();
+
+    const toTransfer = [];
+    const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd.MM.yyyy HH:mm:ss");
+
+    data.forEach((row, i) => {
+      const communicationId = row[idCol - 1]?.toString().trim();
+      const status = row[statusCol - 1]?.toString().trim();
+      const correctness = correctnessValues[i][0]?.toString().trim();
+
+      if (!communicationId || status !== "Выполнена") return;
+
+      if (cachedIds.has(communicationId)) {
+        if (!correctness || correctness !== "Перенесено в БД") {
+          correctnessValues[i][0] = "Перенесено в БД";
+        }
+        return;
+      }
+
+      if (correctness && correctness !== "") return;
+
+      const errors = validateRow(row, workHeaders);
+      const expectedLink = constructLinkAndTrack(row, workHeaders, workSheet, i + 2);
+      const actualLink = row[workHeaders.indexOf("Ссылка + трек")];
+      if (actualLink && expectedLink && actualLink !== expectedLink) {
+        errors.push("❌ Некорректная Ссылка + трек");
+      }
+
+      if (errors.length > 0) {
+        correctnessValues[i][0] = errors.join("; ");
+        return;
+      }
+
+      const newRow = cleanHeaders.map(header => {
+        const index = workHeaders.indexOf(header);
+        if (index > -1) {
+          let value = row[index];
+          if (header === "Трек") value = extractTrackId(value);
+          if (header === "process_lable") value = filterProcessLable(row, workHeaders);
+          return value;
+        } else if (header === "moving_date") {
+          return timestamp;
+        } else {
+          return "";
+        }
+      });
+
+      toTransfer.push(newRow);
+      correctnessValues[i][0] = "Перенесено в БД";
+      cachedIds.add(communicationId);
+    });
+
+    if (toTransfer.length > 0) {
+      cleanSheet.getRange(cleanSheet.getLastRow() + 1, 1, toTransfer.length, cleanHeaders.length).setValues(toTransfer);
+      SpreadsheetApp.flush();
+      Logger.log(`✅ Перенесено строк в ${kpName}: ${toTransfer.length}`);
+    }
+
+    workSheet.getRange(2, correctnessCol, lastRow - 1, 1).setValues(correctnessValues);
+
+    // Сохраняем обновлённый Set обратно
+    PropertiesService.getScriptProperties().setProperty(`clean_ids_${sheetName}`, JSON.stringify(Array.from(cachedIds)));
+
+  } catch (error) {
+    Logger.log(`❌ Ошибка переноса для КП '${kpName}': ${error}`);
+  }
+}
+
+
+// 🎯 Валидация обязательных полей + спец. условий
+function validateRow(row, headers) {
+  const required = [
+    "communication_id", "Дата", "День недели", "Статус рассылки", "Время отправки по МСК",
+    "Канал", "Направление", "Тема рассылки", "ГЕО", "Группа сегментов",
+    "Подсегмент", "Тесты", "Трек", "Название сегмента в CDP"
+  ];
+
+  const errors = [];
+
+  required.forEach(field => {
+    const idx = headers.indexOf(field);
+    if (idx > -1 && (!row[idx] || row[idx].toString().trim() === "")) {
+      errors.push("❌ Пропущено поле: " + field);
+    }
+  });
+
+  const chIdx = headers.indexOf("Канал");
+  const nIdx = headers.indexOf("Тип нотифа");
+  const pIdx = headers.indexOf("process_lable");
+
+  if (chIdx > -1) {
+    const channel = row[chIdx]?.toString().trim();
+    const notifType = nIdx > -1 ? row[nIdx]?.toString().trim() : "";
+    const label = pIdx > -1 ? row[pIdx]?.toString().trim() : "";
+
+    if (channel === "Notification" && !notifType) errors.push("❌ 'Тип нотифа' обязателен");
+    if (channel !== "Notification" && notifType) errors.push("❌ 'Тип нотифа' должно быть пустым");
+    if ((channel === "Whatsapp" || channel === "SMS") && !label) errors.push("❌ 'process_lable' обязателен");
+    if (channel !== "Whatsapp" && channel !== "SMS" && label) errors.push("❌ 'process_lable' должно быть пустым");
+  }
+
+  return errors;
+}
+
+// 🔧 Поддержка: формирование ссылки
+function constructLinkAndTrack(row, headers, sheet, rowIndex) {
+  const m = headers.indexOf("Зеркало"),
+        p = headers.indexOf("Путь"),
+        t = headers.indexOf("Трек");
+
+  const mirror = sheet.getRange(rowIndex, m + 1).getFormula() || row[m] || "";
+  const path = row[p] || "";
+  const track = row[t] || "";
+
+  if (!mirror) return path + track;
+  if (!path) return mirror + track;
+  return mirror + path + track;
+}
+
+// 🔧 Поддержка: обрезка трека (оставляет только ID после ?trid= или &trid=)
+function extractTrackId(track) {
+  if (!track) return "";
+  const match = track.match(/(?:\?|&)trid=([^&]+)/);
+  return match ? match[1] : track;
+}
+
+// 🔧 Поддержка: валидация поля process_lable
+function filterProcessLable(row, headers) {
+  const c = headers.indexOf("Канал"),
+        p = headers.indexOf("process_lable");
+
+  if (c > -1 && p > -1) {
+    const channel = row[c]?.toString().trim();
+    const value = row[p];
+
+    if (channel === "Whatsapp" || channel === "SMS") return value;
+  }
+  return "";
+}
+
+
+
+function transferCompletedRowsFor_ASIA() {
+  transferCompletedRowsFor("CC");
+}
+
+
+function transferCompletedRowsFor_VIP() {
+  transferCompletedRowsFor("VIP");
+}
+
+function transferCompletedRowsFor_LATAM() {
+  transferCompletedRowsFor("LATAM");
+}
+
+function transferCompletedRowsFor_AFRICA() {
+  transferCompletedRowsFor("AFRICA");
+}
+
+function transferCompletedRowsFor_NIGERIA() {
+  transferCompletedRowsFor("NIGERIA");
+}
+
