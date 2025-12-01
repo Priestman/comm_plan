@@ -1,0 +1,341 @@
+function checkDuplicateTracks() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const timeZone = Session.getScriptTimeZone() || "Europe/Moscow"; // Запасная временная зона
+  const now = new Date();
+  now.setHours(19, 58, 0, 0); // Устанавливаем текущее время (07:58 PM CEST)
+
+  // Логируем временную зону и даты
+  Logger.log(`ℹ️ Временная зона скрипта: ${timeZone}`);
+  Logger.log(`ℹ️ Текущая дата: ${now}`);
+
+  const currentMonthName = Utilities.formatDate(now, timeZone, "MMMM_yyyy");
+  Logger.log(`ℹ️ Текущий месяц: ${currentMonthName}`);
+
+  const prevDate = new Date(now);
+  prevDate.setMonth(prevDate.getMonth() - 1);
+  const previousMonthName = Utilities.formatDate(prevDate, timeZone, "MMMM_yyyy");
+  Logger.log(`ℹ️ Предыдущий месяц: ${previousMonthName}`);
+
+  const nextDate = new Date(now);
+  nextDate.setMonth(nextDate.getMonth() + 1);
+  const nextMonthName = Utilities.formatDate(nextDate, timeZone, "MMMM_yyyy");
+  Logger.log(`ℹ️ Следующий месяц: ${nextMonthName}`);
+
+  // Проверяем и фильтруем имена месяцев
+  const monthsToCollect = [previousMonthName, currentMonthName, nextMonthName].filter(name => name && name !== "undefined");
+  if (monthsToCollect.length === 0) {
+    Logger.log(`❌ Ошибка: ни одно имя месяца не определено.`);
+    return;
+  }
+
+  const validSheetPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/;
+
+  const allTracks = new Map();
+
+  // Сбор всех треков за 3 месяца
+  monthsToCollect.forEach(monthName => {
+    Logger.log(`ℹ️ Проверка листа для сбора треков: ${monthName}`);
+    const sheet = spreadsheet.getSheetByName(monthName);
+    if (!sheet || !validSheetPattern.test(monthName)) { // Проверяем только имя, так как лист может отсутствовать
+      Logger.log(`ℹ️ Лист '${monthName}' не найден или имеет некорректное имя. Пропуск сбора треков.`);
+      return;
+    }
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= 1) {
+      Logger.log(`ℹ️ Лист '${monthName}' пуст или содержит только заголовки. Пропуск сбора треков.`);
+      return;
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const trackCol = headers.indexOf("Трек") + 1;
+    const statusCol = headers.indexOf("Статус рассылки") + 1;
+
+    if (trackCol < 1 || statusCol < 1) {
+      Logger.log(`❌ В листе '${monthName}' не найдены столбцы "Трек" или "Статус рассылки". Пропуск сбора.`);
+      return;
+    }
+
+    const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+    const statusValues = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
+
+    trackValues.forEach((row, idx) => {
+      const track = row[0]?.toString().trim();
+      const status = statusValues[idx][0]?.toString().trim();
+      const sheetRowNumber = idx + 2;
+
+      if (!track || status === "Отменена" || status === "Не ушла") return;
+
+      const normalized = extractTrackId(track);
+      if (!normalized) return;
+
+      if (!allTracks.has(normalized)) allTracks.set(normalized, []);
+      allTracks.get(normalized).push({ month: monthName, trackRow: sheetRowNumber });
+    });
+  });
+
+  // Запуск проверки и автогенерации только для определенных месяцев
+  const monthsToProcessForGeneration = [currentMonthName, nextMonthName].filter(name => name && name !== "undefined");
+  if (monthsToProcessForGeneration.length === 0) {
+    Logger.log(`❌ Ошибка: нет валидных месяцев для обработки (currentMonthName: ${currentMonthName}, nextMonthName: ${nextMonthName}).`);
+    return;
+  }
+
+  monthsToProcessForGeneration.forEach(targetMonthName => {
+    Logger.log(`ℹ️ Начало обработки листа: ${targetMonthName}`);
+    try {
+      processSheetForTracks(spreadsheet, targetMonthName, allTracks, validSheetPattern, timeZone);
+    } catch (e) {
+      Logger.log(`❌ Ошибка при обработке листа '${targetMonthName}': ${e.message}`);
+    }
+    Logger.log(`ℹ️ Завершение обработки листа: ${targetMonthName}`);
+  });
+
+  Logger.log("✅ Общая проверка и автогенерация треков завершена.");
+}
+
+function processSheetForTracks(spreadsheet, sheetName, allTracksMap, validSheetPattern, timeZone) {
+  Logger.log(`⚙️ Обработка листа: '${sheetName}' для проверки и генерации...`);
+  if (!sheetName || sheetName === "undefined") {
+    Logger.log(`❌ Ошибка: sheetName не определено (${sheetName}). Пропуск обработки.`);
+    return;
+  }
+
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet || !validSheetPattern.test(sheet.getName())) {
+    Logger.log(`⚠ Лист '${sheetName}' не найден или имеет некорректное имя. Пропуск обработки.`);
+    return;
+  }
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const trackCol = headers.indexOf("Трек") + 1;
+  const statusCol = headers.indexOf("Статус рассылки") + 1;
+  const correctnessCol = headers.indexOf("Корректность строки") + 1;
+  const autoGenCol = headers.indexOf("Автоматически генерировать трек") + 1;
+
+  if (trackCol < 1 || statusCol < 1 || correctnessCol < 1 || autoGenCol < 1) {
+    Logger.log(`❌ В листе '${sheetName}' не найдены нужные столбцы. Пропуск.`);
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    Logger.log(`ℹ️ Лист '${sheetName}' пуст или содержит только заголовки. Пропуск.`);
+    return;
+  }
+
+  // Получаем данные и сохраняем оригинальные значения
+  const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+  const statusValues = sheet.getRange(2, statusCol, lastRow - 1, 1).getValues();
+  const correctnessValues = sheet.getRange(2, correctnessCol, lastRow - 1, 1).getValues();
+  const autoGenValues = sheet.getRange(2, autoGenCol, lastRow - 1, 1).getValues();
+
+  // Сохраняем оригинальные значения для сравнения
+  const originalTrackValues = trackValues.map(row => [row[0]]);
+  const originalCorrectnessValues = correctnessValues.map(row => [row[0]]);
+
+  // Массивы для отслеживания изменений
+  const changedTracks = [];
+  const changedCorrectness = [];
+
+  const usedTridsInCurrentProcessingSheet = new Set();
+  const monthNumberForThisSheet = getMonthNumber(sheetName);
+
+  for (let i = 0; i < trackValues.length; i++) {
+    const rawTrack = trackValues[i][0]?.toString().trim();
+    const status = statusValues[i][0]?.toString().trim();
+    const autoGen = autoGenValues[i][0]?.toString().toLowerCase().trim();
+    const currentRowNumber = i + 2;
+
+    const normalizedTrackId = extractTrackId(rawTrack);
+
+    const globalDuplicates = allTracksMap.get(normalizedTrackId)?.filter(
+        entry => entry.month !== sheetName || entry.trackRow !== currentRowNumber
+    );
+    const hasGlobalDuplicates = globalDuplicates && globalDuplicates.length > 0;
+
+    const hasLocalDuplicateInThisRun = normalizedTrackId && usedTridsInCurrentProcessingSheet.has(normalizedTrackId);
+
+    const isTrackValidFormat = isTrackValid(normalizedTrackId, monthNumberForThisSheet);
+
+    if (status === "Выполнена" || status === "Согласовано") {
+      let newCorrectnessValue = "";
+      
+      if (hasGlobalDuplicates) {
+        newCorrectnessValue = `❌ Дублирующийся трек (глобальный), но строка защищена: ${globalDuplicates.map(d => `${d.month} (строка ${d.trackRow})`).join(", ")}`;
+      } else if (hasLocalDuplicateInThisRun) {
+        newCorrectnessValue = `❌ Дублирующийся трек (в текущем листе), но строка защищена`;
+      } else if (correctnessValues[i][0] !== "Перенесено в БД") {
+        newCorrectnessValue = "";
+      } else {
+        newCorrectnessValue = correctnessValues[i][0]; // Оставляем как было
+      }
+      
+      // Проверяем, изменилось ли значение корректности
+      if (newCorrectnessValue !== originalCorrectnessValues[i][0]) {
+        correctnessValues[i][0] = newCorrectnessValue;
+        changedCorrectness.push({
+          row: currentRowNumber,
+          value: newCorrectnessValue,
+          oldValue: originalCorrectnessValues[i][0]
+        });
+      }
+      
+      if (normalizedTrackId) {
+        usedTridsInCurrentProcessingSheet.add(normalizedTrackId);
+        if (!allTracksMap.has(normalizedTrackId) || !allTracksMap.get(normalizedTrackId).some(e => e.month === sheetName && e.trackRow === currentRowNumber)) {
+          allTracksMap.set(normalizedTrackId, (allTracksMap.get(normalizedTrackId) || []).concat({month: sheetName, trackRow: currentRowNumber}));
+        }
+      }
+      continue;
+    }
+
+    const shouldGenerate = autoGen === "да" && (!rawTrack || !isTrackValidFormat || hasGlobalDuplicates || hasLocalDuplicateInThisRun);
+
+    if (shouldGenerate) {
+      const { fullTrack, normalized: newGeneratedTrid } = generateUniqueTrack(monthNumberForThisSheet, usedTridsInCurrentProcessingSheet);
+      
+      // Проверяем, изменился ли трек
+      if (fullTrack !== originalTrackValues[i][0]) {
+        trackValues[i][0] = fullTrack;
+        changedTracks.push({
+          row: currentRowNumber,
+          value: fullTrack,
+          oldValue: originalTrackValues[i][0],
+          action: 'generated'
+        });
+      }
+      
+      // Проверяем, изменилась ли корректность
+      if (correctnessValues[i][0] !== "") {
+        correctnessValues[i][0] = "";
+        changedCorrectness.push({
+          row: currentRowNumber,
+          value: "",
+          oldValue: originalCorrectnessValues[i][0],
+          action: 'cleared'
+        });
+      }
+      
+      usedTridsInCurrentProcessingSheet.add(newGeneratedTrid);
+      if (!allTracksMap.has(newGeneratedTrid)) {
+        allTracksMap.set(newGeneratedTrid, []);
+      }
+      allTracksMap.get(newGeneratedTrid).push({ month: sheetName, trackRow: currentRowNumber });
+    } else {
+      let newCorrectnessValue = "";
+      
+      if (normalizedTrackId) {
+        usedTridsInCurrentProcessingSheet.add(normalizedTrackId);
+        if (!isTrackValidFormat) {
+          newCorrectnessValue = "❌ Некорректный формат трека";
+        } else if (hasGlobalDuplicates) {
+          newCorrectnessValue = `❌ Дублирующийся трек в ${globalDuplicates.map(d => `${d.month} (строка ${d.trackRow})`).join(", ")}`;
+        } else if (hasLocalDuplicateInThisRun) {
+          newCorrectnessValue = `❌ Дублирующийся трек в текущем листе`;
+        } else {
+          newCorrectnessValue = "";
+        }
+      } else {
+        if (autoGen !== "да") {
+          newCorrectnessValue = "❌ Отсутствие трека";
+        }
+      }
+      
+      // Проверяем, изменилось ли значение корректности
+      if (newCorrectnessValue !== originalCorrectnessValues[i][0]) {
+        correctnessValues[i][0] = newCorrectnessValue;
+        changedCorrectness.push({
+          row: currentRowNumber,
+          value: newCorrectnessValue,
+          oldValue: originalCorrectnessValues[i][0],
+          action: 'validation'
+        });
+      }
+    }
+  }
+
+  // Записываем только измененные значения
+  let trackChangesCount = 0;
+  let correctnessChangesCount = 0;
+
+  if (changedTracks.length > 0) {
+    changedTracks.forEach(change => {
+      try {
+        sheet.getRange(change.row, trackCol).setValue(change.value);
+        trackChangesCount++;
+        Logger.log(`🔄 Строка ${change.row}: трек "${change.oldValue}" → "${change.value}" (${change.action})`);
+      } catch (error) {
+        Logger.log(`❌ Ошибка записи трека в строку ${change.row}: ${error.toString()}`);
+      }
+    });
+  }
+
+  if (changedCorrectness.length > 0) {
+    changedCorrectness.forEach(change => {
+      try {
+        sheet.getRange(change.row, correctnessCol).setValue(change.value);
+        correctnessChangesCount++;
+        if (change.action) {
+          Logger.log(`🔄 Строка ${change.row}: корректность "${change.oldValue}" → "${change.value}" (${change.action})`);
+        }
+      } catch (error) {
+        Logger.log(`❌ Ошибка записи корректности в строку ${change.row}: ${error.toString()}`);
+      }
+    });
+  }
+
+  // Итоговая статистика
+  if (trackChangesCount > 0 || correctnessChangesCount > 0) {
+    Logger.log(`✅ Лист '${sheetName}': обновлено треков: ${trackChangesCount}, корректности: ${correctnessChangesCount}`);
+  } else {
+    Logger.log(`ℹ️ Лист '${sheetName}': изменений не требуется (все данные актуальны)`);
+  }
+
+  Logger.log(`✅ Проверка и автогенерация для листа '${sheetName}' завершена.`);
+}
+
+function extractTrackId(track) {
+  if (!track) return null;
+  const match = track.match(/(?:\?|&)trid=([^&]*)/);
+  return match && match[1]?.trim() ? match[1].trim() : null;
+}
+
+function isTrackValid(trackId, monthNumber) {
+  return trackId ? new RegExp(`^crvp${monthNumber}[A-Z0-9]{6}$`).test(trackId) : false;
+}
+
+function generateUniqueTrack(monthNumber, usedTrids, maxAttempts = 100) {
+  let attempt = 0;
+  let newTrack, normalized;
+
+  do {
+    const randomStr = Math.random().toString(36).substring(2, 8).toUpperCase();
+    normalized = `crvp${monthNumber}${randomStr}`;
+    attempt++;
+    if (attempt >= maxAttempts) {
+      Logger.log(`⚠️ Не удалось сгенерировать уникальный трек после ${maxAttempts} попыток. Возможно, исчерпаны доступные ID.`);
+      return { fullTrack: "?trid=GENERATION_FAILED", normalized: "GENERATION_FAILED" };
+    }
+  } while (usedTrids.has(normalized));
+
+  return {
+    fullTrack: `?trid=${normalized}`,
+    normalized
+  };
+}
+
+function getMonthNumber(sheetName) {
+  const [monthName] = sheetName.split("_");
+  const months = {
+    January: "1", February: "2", March: "3", April: "4", May: "5",
+    June: "6", July: "7", August: "8", September: "9", October: "10",
+    November: "11", December: "12"
+  };
+  const number = months[monthName];
+  if (!number) {
+    Logger.log(`❌ Не удалось определить номер месяца для имени листа: '${sheetName}'`);
+    return "0";
+  }
+  return number;
+}
