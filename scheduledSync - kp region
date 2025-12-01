@@ -1,0 +1,113 @@
+function scheduledSync() {
+  Logger.log("🚀 [START] Запуск scheduledSync()");
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const timeZone = Session.getScriptTimeZone();
+  const today = new Date();
+
+  const currentMonth = Utilities.formatDate(today, timeZone, "MMMM_yyyy");
+  const nextMonthDate = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+  const nextMonth = Utilities.formatDate(nextMonthDate, timeZone, "MMMM_yyyy");
+
+  const sheetsToProcess = [currentMonth];
+
+  if (ss.getSheetByName(nextMonth)) {
+    sheetsToProcess.push(nextMonth);
+    Logger.log(`📅 Найден и следующий месяц: ${nextMonth}`);
+  }
+
+  sheetsToProcess.forEach(sheetName => processMonthSheet(ss, sheetName));
+  Logger.log("🏁 Все листы обработаны.");
+}
+
+function processMonthSheet(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return Logger.log(`⚠ Лист ${sheetName} не найден.`);
+
+  Logger.log(`📄 Обработка листа: ${sheetName}`);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const col = name => headers.indexOf(name) + 1;
+
+  const geoCol = col("ГЕО");
+  const mirrorCol = col("Зеркало");
+  const pathCol = col("Путь");
+  const trackCol = col("Трек");
+  const linkTrackCol = col("Ссылка + трек");
+  const refGeoCol = col("ГЕО");
+  const refChannelCol = col("Канал");
+  const refTimeCol = col("Время отправки по МСК");
+  const geoNCol = col("Гео_N");
+  const channelNCol = col("Канал_N");
+  const timeNCol = col("Время_N");
+  const refprocessCol = col("process_lable");
+  const segmentCol = col("Сегмент_N");
+  const textCol = col("Текст");
+  const textSourceCol = col("Ссылка на текст");
+  const channelCol = col("Канал");
+  const autoMirrorCol = col("auto_mirror");
+
+  if (!geoCol || !mirrorCol || !pathCol || !trackCol || !linkTrackCol ||
+      !geoNCol || !channelNCol || !timeNCol || !refprocessCol ||
+      !segmentCol || !textCol || !textSourceCol || !channelCol || !autoMirrorCol) {
+    return Logger.log(`⚠ Не все нужные столбцы найдены на листе ${sheetName}.`);
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return Logger.log(`⚠ В листе ${sheetName} нет данных.`);
+
+  const geoValues = sheet.getRange(2, geoCol, lastRow - 1, 1).getValues();
+  const mirrorValues = sheet.getRange(2, mirrorCol, lastRow - 1, 1).getValues();
+  const pathValues = sheet.getRange(2, pathCol, lastRow - 1, 1).getValues();
+  const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+  const channelValues = sheet.getRange(2, channelCol, lastRow - 1, 1).getValues();
+  const textSourceValues = sheet.getRange(2, textSourceCol, lastRow - 1, 1).getValues();
+  const autoMirrorValues = sheet.getRange(2, autoMirrorCol, lastRow - 1, 1).getValues();
+
+  const geoMirrorCache = JSON.parse(PropertiesService.getScriptProperties().getProperty("geo_mirror_cache") || "{}");
+
+  const textFormulas = [], mirrorUpdates = [], linkTrackUpdates = [];
+  const geoFormulas = [], channelFormulas = [], timeFormulas = [], processFormulas = [];
+
+  for (let i = 0; i < lastRow - 1; i++) {
+    const autoMirror = autoMirrorValues[i][0] === true;
+    const geo = geoValues[i][0]?.toString().trim().toUpperCase();
+    const mirror = mirrorValues[i][0]?.toString().trim() || "";
+    const path = pathValues[i][0]?.toString().trim() || "";
+    const track = trackValues[i][0]?.toString().trim() || "";
+    const channel = channelValues[i][0];
+
+    let mirrorToUse = mirror;
+    if (autoMirror && geo && !geo.includes(",") && geoMirrorCache[geo]) {
+      mirrorToUse = geoMirrorCache[geo];
+    }
+
+    mirrorUpdates.push([mirrorToUse]);
+    linkTrackUpdates.push([(mirrorToUse || "") + path + track]);
+
+    const textCell = sheet.getRange(i + 2, textSourceCol).getA1Notation();
+    const linkCell = sheet.getRange(i + 2, linkTrackCol).getA1Notation();
+    if (channel === "Telegram" || channel === "Whatsapp") {
+      textFormulas.push([`=${textCell}&CHAR(10)&${linkCell}`]);
+    } else if (channel === "SMS") {
+      textFormulas.push([`=${textCell}&" "&${linkCell}`]);
+    } else {
+      textFormulas.push([""]);
+    }
+
+    geoFormulas.push([`=${sheet.getRange(i + 2, refGeoCol).getA1Notation()}`]);
+    channelFormulas.push([`=${sheet.getRange(i + 2, refChannelCol).getA1Notation()}`]);
+    timeFormulas.push([`=${sheet.getRange(i + 2, refTimeCol).getA1Notation()}`]);
+    processFormulas.push([`=${sheet.getRange(i + 2, refprocessCol).getA1Notation()}`]);
+  }
+
+  sheet.getRange(2, mirrorCol, mirrorUpdates.length, 1).setValues(mirrorUpdates);
+  sheet.getRange(2, linkTrackCol, linkTrackUpdates.length, 1).setValues(linkTrackUpdates);
+  sheet.getRange(2, geoNCol, geoFormulas.length, 1).setFormulas(geoFormulas);
+  sheet.getRange(2, channelNCol, channelFormulas.length, 1).setFormulas(channelFormulas);
+  sheet.getRange(2, timeNCol, timeFormulas.length, 1).setFormulas(timeFormulas);
+  sheet.getRange(2, segmentCol, processFormulas.length, 1).setFormulas(processFormulas);
+  sheet.getRange(2, textCol, textFormulas.length, 1).setFormulas(textFormulas);
+
+  Logger.log(`✅ Лист ${sheetName} успешно обработан.`);
+}
