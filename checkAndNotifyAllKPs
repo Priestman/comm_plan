@@ -1,0 +1,113 @@
+const MASTER_SPREADSHEET_ID = "1JHFCWOj4A82dSNeLHb68B5JHHPxfvHHxg8_e4tjjQtY";
+
+
+function checkAndNotifyAllKPs() {
+  const masterSpreadsheet = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const masterSheet = masterSpreadsheet.getActiveSheet();
+  const masterData = masterSheet.getDataRange().getValues();
+
+  // Получаем название листа для текущего месяца (например, "October_2025")
+  const today = new Date();
+  const currentMonthName = Utilities.formatDate(today, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "MMMM");
+  const currentYear = today.getFullYear();
+  const currentSheetName = `${currentMonthName}_${currentYear}`;
+
+  // Получаем название листа для предыдущего месяца
+  const lastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  const lastMonthName = Utilities.formatDate(lastMonth, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "MMMM");
+  const lastYear = lastMonth.getFullYear();
+  const lastSheetName = `${lastMonthName}_${lastYear}`;
+
+  const targetSheetNames = [currentSheetName, lastSheetName];
+
+  Logger.log(`✅ Начинаем проверку. Целевые листы: ${targetSheetNames.join(', ')}`);
+
+  // Начинаем с 1, чтобы пропустить заголовок
+  for (let i = 1; i < masterData.length; i++) {
+    const row = masterData[i];
+    const kpName = row[0]; // Столбец A (name)
+    const spreadsheetId = row[2]; // Столбец C (id_clean)
+    const activeStatus = row[4]; // Столбец E (active)
+
+    // Проверяем, что КП активен
+    if (activeStatus && activeStatus.toUpperCase() === 'YES') {
+      Logger.log(`➡️ Обработка КП: ${kpName}`);
+      try {
+        // Проверяем оба листа (текущий и предыдущий месяц)
+        for (const sheetName of targetSheetNames) {
+          processSingleKP(spreadsheetId, kpName, sheetName);
+        }
+      } catch (e) {
+        Logger.log(`❌ Ошибка доступа к таблице ${kpName} (ID: ${spreadsheetId}): ${e.toString()}`);
+      }
+    } else {
+      Logger.log(`➡️ Пропускаем КП "${kpName}", так как он неактивен.`);
+    }
+  }
+}
+
+function processSingleKP(spreadsheetId, kpName, sheetName) {
+  const kpSpreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  const kpSheet = kpSpreadsheet.getSheetByName(sheetName);
+
+  // Проверяем, существует ли лист с нужным именем
+  if (!kpSheet) {
+    Logger.log(`⚠️ В таблице "${kpName}" не найден лист "${sheetName}". Пропускаем.`);
+    return;
+  }
+  
+  const kpValues = kpSheet.getDataRange().getValues();
+  if (kpValues.length <= 1) {
+    Logger.log(`⚠️ Лист "${sheetName}" в таблице "${kpName}" пуст. Пропускаем.`);
+    return;
+  }
+
+  let errorRows = [];
+  const communicationIdCol = 0; // Столбец A (индекс 0)
+  const dateCol = 1; // Столбец B (индекс 1)
+  const timeCol = 4; // Столбец E (индекс 4)
+
+  // Начинаем с 1, чтобы пропустить заголовок
+  for (let i = 1; i < kpValues.length; i++) {
+    const row = kpValues[i];
+    const communicationId = row[communicationIdCol];
+    const date = row[dateCol];
+    const time = row[timeCol];
+
+    if (communicationId && (!date || !time)) {
+      errorRows.push(i + 1); // Добавляем номер строки (индексация начинается с 1)
+    }
+  }
+  
+  if (errorRows.length > 0) {
+    const subject = `Не заполнены обязательные поля в КП "${kpName}" (лист ${sheetName})`;
+    const body = `Обнаружены ошибки в следующих строках в таблице "${kpName}" на листе "${sheetName}":\n
+${errorRows.map(rowNum => `Строка ${rowNum}`).join('\n')}
+
+Пожалуйста, проверьте и заполните данные в столбцах "Дата" и "Время отправки по МСК".`;
+
+    sendErrorNotification(subject, body, kpName, sheetName);
+  } else {
+    Logger.log(`✅ Ошибок на листе "${sheetName}" КП "${kpName}" не найдено.`);
+  }
+}
+
+function sendErrorNotification(subject, body, kpName, sheetName) {
+  try {
+    const recipients = "rostislav.shevchenko@1win.pro,alisa.rumyantseva@1win.pro"; 
+    const fullSubject = `[КП Clean] ${subject}`;
+    const fullBody = `не хватает данных (Дата,время) в чистовом КП:
+
+${body}
+
+Время: ${new Date()}
+Функция: checkAndNotifyAllKPs()
+
+Требуется проверка системы.`;
+
+    MailApp.sendEmail(recipients, fullSubject, fullBody);
+    Logger.log(`📧 Отправлено уведомление об ошибке: ${fullSubject}`);
+  } catch (emailError) {
+    Logger.log(`❌ Ошибка отправки email уведомления: ${emailError}`);
+  }
+}
