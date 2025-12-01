@@ -1,0 +1,405 @@
+function scheduledSync() {
+  Logger.log("🚀 [START] Запуск scheduledSync()");
+
+  const ss = SpreadsheetApp.openById('1cuuCfjbtAPbEtXd0f6cYC8OEAnMeoF2-l44NamqZaV8');
+  const timeZone = Session.getScriptTimeZone();
+  const today = new Date();
+
+  const currentMonth = Utilities.formatDate(today, timeZone, "MMMM_yyyy");
+  const nextMonthDate = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+  const nextMonth = Utilities.formatDate(nextMonthDate, timeZone, "MMMM_yyyy");
+
+  const sheetsToProcess = [currentMonth]; // текущий добавляем всегда
+
+    Logger.log("🏁 Все листы обработаны.");
+
+  Logger.log("DEBUG: currentMonth = " + currentMonth);
+Logger.log("DEBUG: nextMonth = " + nextMonth);
+Logger.log("DEBUG: ss = " + (ss ? "OK" : "undefined/null"));
+Logger.log("DEBUG: sheetsToProcess = " + JSON.stringify(sheetsToProcess));
+
+  const hasNext = ss.getSheetByName(nextMonth);
+  if (hasNext) {
+    sheetsToProcess.push(nextMonth);
+    Logger.log(`📅 Найден и следующий месяц: ${nextMonth}`);
+  }
+
+  sheetsToProcess.forEach(sheetName => {
+    Logger.log(`🔄 Обрабатываем лист: ${sheetName}`);
+    processMonthSheet(ss, sheetName);
+  });
+
+}
+
+function processMonthSheet(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return Logger.log(`⚠ Лист ${sheetName} не найден.`);
+
+  Logger.log(`📄 Обработка листа: ${sheetName}`);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  hardRepairProcessLabels(sheet, headers);
+
+  const col = name => headers.indexOf(name) + 1;
+  const geoCol = col("ГЕО");
+  const mirrorCol = col("Зеркало");
+  const pathCol = col("Путь");
+  const trackCol = col("Трек");
+  const linkTrackCol = col("Ссылка + трек");
+  const refGeoCol = col("ГЕО");
+  const refChannelCol = col("Канал");
+  const refTimeCol = col("Время отправки по МСК");
+  const geoNCol = col("Гео_N");
+  const channelNCol = col("Канал_N");
+  const timeNCol = col("Время_N");
+  const refprocessCol = col("process_lable");
+  const segmentCol = col("Сегмент_N");
+  const textCol = col("Текст");
+  const textSourceCol = col("Ссылка на текст");
+  const channelCol = col("Канал");
+
+  if (!geoCol || !mirrorCol || !pathCol || !trackCol || !linkTrackCol || !geoNCol || !channelNCol || !timeNCol || !refprocessCol || !segmentCol || !textCol || !textSourceCol || !channelCol)
+    return Logger.log(`⚠ Не все нужные столбцы найдены на листе ${sheetName}.`);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return Logger.log(`⚠ В листе ${sheetName} нет данных.`);
+
+  const geoValues = sheet.getRange(2, geoCol, lastRow - 1, 1).getValues();
+  const mirrorValues = sheet.getRange(2, mirrorCol, lastRow - 1, 1).getValues();
+  const pathValues = sheet.getRange(2, pathCol, lastRow - 1, 1).getValues();
+  const trackValues = sheet.getRange(2, trackCol, lastRow - 1, 1).getValues();
+  const channelValues = sheet.getRange(2, channelCol, lastRow - 1, 1).getValues();
+  const textSourceValues = sheet.getRange(2, textSourceCol, lastRow - 1, 1).getValues();
+
+  const geoMirrorCache = JSON.parse(PropertiesService.getScriptProperties().getProperty("geo_mirror_cache") || "{}");
+
+  const textFormulas = [], mirrorUpdates = [], linkTrackUpdates = [];
+  const geoFormulas = [], channelFormulas = [], timeFormulas = [], processFormulas = [];
+
+  // ✅ ДОБАВЛЕННАЯ ЧАСТЬ — обновление "Трек", если он не содержит ?trid= или &trid=
+const updatedTrackValues = [];
+let hasRealChange = false;
+
+for (let i = 0; i < lastRow - 1; i++) {
+  let originalTrack = trackValues[i][0]?.toString().trim() || "";
+  const path = pathValues[i][0]?.toString().trim() || "";
+
+  if (!originalTrack) {
+    updatedTrackValues.push([originalTrack]);
+    continue;
+  }
+
+  let newTrack = originalTrack;
+  const hasTrid = /\?(trid=)/.test(originalTrack) || /&(trid=)/.test(originalTrack);
+
+  if (!hasTrid) {
+    const delim = path.includes("?") ? "&" : "?";
+    const clean = originalTrack.replace(/^[\?&]?/, '');
+    newTrack = `${delim}trid=${clean}`;
+  } else {
+    const pathHasQuery = path.includes("?");
+    if (originalTrack.startsWith("?trid=") && pathHasQuery) {
+      newTrack = originalTrack.replace("?trid=", "&trid=");
+    }
+    if (originalTrack.startsWith("&trid=") && !pathHasQuery) {
+      newTrack = originalTrack.replace("&trid=", "?trid=");
+    }
+  }
+
+  if (newTrack !== originalTrack) {
+    hasRealChange = true;
+    trackValues[i][0] = newTrack;
+  }
+
+  updatedTrackValues.push([newTrack]);
+}
+
+// 💾 Применяем обновление только при реальных изменениях
+if (hasRealChange) {
+  sheet.getRange(2, trackCol, updatedTrackValues.length, 1).setValues(updatedTrackValues);
+  Logger.log("📌 Обновлены значения в колонке 'Трек'");
+} else {
+  Logger.log("✅ Никаких изменений в 'Трек' не требуется");
+}
+
+
+  // 📦 Основная логика (не меняем)
+  for (let i = 0; i < lastRow - 1; i++) {
+    const geo = geoValues[i][0]?.toString().trim().toUpperCase();
+    const mirror = mirrorValues[i][0]?.toString().trim() || "";
+    const path = pathValues[i][0]?.toString().trim() || "";
+    const track = trackValues[i][0]?.toString().trim() || "";
+    const channel = channelValues[i][0];
+
+    let mirrorToUse = mirror;
+    if (geo && !geo.includes(",") && geoMirrorCache[geo]) {
+      const expectedMirror = geoMirrorCache[geo];
+      const isCustomTmePath = path.includes("t.me") || path.includes("/t.me/");
+      if (mirror !== expectedMirror && !isCustomTmePath) {
+        mirrorToUse = expectedMirror;
+      }
+    } else {
+      mirrorToUse = "";
+    }
+
+    mirrorUpdates.push([mirrorToUse]);
+    linkTrackUpdates.push([(mirrorToUse || "") + path + track]);
+
+    const textCell = sheet.getRange(i + 2, textSourceCol).getA1Notation();
+    const linkCell = sheet.getRange(i + 2, linkTrackCol).getA1Notation();
+    if (channel === "Telegram" || channel === "Whatsapp" || channel === "WA/TG/SMS") {
+      textFormulas.push([`=${textCell}&CHAR(10)&${linkCell}`]);
+    } else if (channel === "SMS") {
+      textFormulas.push([`=${textCell}&" "&${linkCell}`]);
+    } else {
+      textFormulas.push([""]);
+    }
+
+    geoFormulas.push([`=${sheet.getRange(i + 2, refGeoCol).getA1Notation()}`]);
+    channelFormulas.push([`=${sheet.getRange(i + 2, refChannelCol).getA1Notation()}`]);
+    timeFormulas.push([`=${sheet.getRange(i + 2, refTimeCol).getA1Notation()}`]);
+    processFormulas.push([`=${sheet.getRange(i + 2, refprocessCol).getA1Notation()}`]);
+  }
+
+  // 💾 Обновление значений
+  sheet.getRange(2, mirrorCol, mirrorUpdates.length, 1).setValues(mirrorUpdates);
+  sheet.getRange(2, linkTrackCol, linkTrackUpdates.length, 1).setValues(linkTrackUpdates);
+  sheet.getRange(2, geoNCol, geoFormulas.length, 1).setFormulas(geoFormulas);
+  sheet.getRange(2, channelNCol, channelFormulas.length, 1).setFormulas(channelFormulas);
+  sheet.getRange(2, timeNCol, timeFormulas.length, 1).setFormulas(timeFormulas);
+  sheet.getRange(2, segmentCol, processFormulas.length, 1).setFormulas(processFormulas);
+  sheet.getRange(2, textCol, textFormulas.length, 1).setFormulas(textFormulas);
+
+  Logger.log(`✅ Лист ${sheetName} успешно обработан.`);
+}
+
+function hardRepairProcessLabels(sheet, headers) {
+  const col = name => headers.indexOf(name) + 1;
+
+  const dateCol   = col("Дата");
+  const chanCol   = col("Канал");
+  const statusCol = col("Статус рассылки");
+  const labelCol  = col("process_lable");
+
+  if (!(dateCol && chanCol && statusCol && labelCol)) {
+    Logger.log("⚠ hardRepairProcessLabels: нет ключевых колонок (Дата/Канал/Статус/process_lable). Пропуск.");
+    return;
+  }
+
+  const FIRST = 2;
+  const lastRow = sheet.getLastRow();
+  const n = lastRow - FIRST + 1;
+  if (n <= 0) return;
+
+  const tz = Session.getScriptTimeZone();
+
+  const dates   = sheet.getRange(FIRST, dateCol,   n, 1).getValues();
+  const chans   = sheet.getRange(FIRST, chanCol,   n, 1).getValues();
+  const stats   = sheet.getRange(FIRST, statusCol, n, 1).getValues();
+  const labels  = sheet.getRange(FIRST, labelCol,  n, 1).getValues();
+
+  const newLabels = labels.map(r => [r[0]]);
+  let changed = false;
+
+  // ---------- helpers ----------
+  const isEligible = ch => {
+    const s = String(ch||"").trim().toLowerCase();
+    return s === "wa/tg/sms" || s === "sms" || s === "whatsapp" || s === "telegram";
+  };
+  const isFrozen  = st => {
+    const s = String(st||"").trim().toLowerCase();
+    return s === "согласована" || s === "выполнена" || s === "отменена";
+  };
+  const toDDMM = v => {
+    if (Object.prototype.toString.call(v) === "[object Date]") {
+      return Utilities.formatDate(v, tz, "dd.MM");
+    }
+    const s = String(v||"").trim();
+    const m = /^(\d{2})\.(\d{2})(?:\.(\d{4}))?$/.exec(s);
+    return m ? `${m[1]}.${m[2]}` : null;
+  };
+  const parseNum = lbl => {
+    const m = /^4_\d{2}\.\d{2}_(\d+)$/.exec(String(lbl||"").trim());
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const labelDate = lbl => {
+    const m = /^4_(\d{2}\.\d{2})_\d+$/.exec(String(lbl||"").trim());
+    return m ? m[1] : null;
+  };
+
+  const perDay = new Map(); // ddmm -> { used:Set, kept:Set, frozenUsed:Set, reassign:[], generate:[] }
+  const dayObj = d => (perDay.get(d) || (perDay.set(d, {used:new Set(), kept:new Set(), frozenUsed:new Set(), reassign:[], generate:[]}), perDay.get(d)));
+
+  // Логи изменений
+  const changes = []; // {row, ddmm, before, after, reason}
+  const MAX_DETAIL = 200; // сколько подробных записей печатать в Logger
+
+  // ---------- Step 0: очистка у незамороженных (нецелевой канал / нет даты) ----------
+  for (let i = 0; i < n; i++) {
+    const eligible = isEligible(chans[i][0]);
+    const ddmm = toDDMM(dates[i][0]);
+    const frozen = isFrozen(stats[i][0]);
+    if (!frozen && (!eligible || !ddmm)) {
+      const before = String(newLabels[i][0] || "");
+      if (before) {
+        newLabels[i][0] = "";
+        changed = true;
+        changes.push({
+          row: FIRST + i,
+          ddmm: ddmm || "-",
+          before,
+          after: "",
+          reason: "cleared_ineligible_or_no_date"
+        });
+      }
+    }
+  }
+
+  // ---------- Step 1: frozen занимают номера ----------
+  for (let i = 0; i < n; i++) {
+    const ddmm = toDDMM(dates[i][0]);
+    if (!ddmm) continue;
+    if (!isEligible(chans[i][0])) continue;
+
+    if (isFrozen(stats[i][0])) {
+      const num = parseNum(newLabels[i][0]);
+      const ld  = labelDate(newLabels[i][0]);
+      if (num != null && ld === ddmm) {
+        const d = dayObj(ddmm);
+        d.used.add(num);
+        d.frozenUsed.add(num); // помечаем как занятый именно frozen
+      }
+    }
+  }
+
+  // ---------- Step 2: незамороженные: кто остаётся, кто в очередь ----------
+  for (let i = 0; i < n; i++) {
+    const ddmm = toDDMM(dates[i][0]);
+    if (!ddmm) continue;
+    if (!isEligible(chans[i][0])) continue;
+    if (isFrozen(stats[i][0])) continue;
+
+    const d = dayObj(ddmm);
+    const cur = String(newLabels[i][0] || "").trim();
+    const num = parseNum(cur);
+    const ld  = labelDate(cur);
+    const valid = (num != null) && (ld === ddmm);
+
+    if (valid && !d.used.has(num) && !d.kept.has(num)) {
+      // первый незамороженный владелец незанятого номера — оставляем
+      d.used.add(num);
+      d.kept.add(num);
+    } else if (valid) {
+      // дубликат либо конфликт с frozen
+      d.reassign.push({
+        i,
+        old: cur,
+        num,
+        conflictFrozen: d.frozenUsed.has(num)
+      });
+    } else {
+      // пустая/невалидная/чужая дата
+      d.generate.push({
+        i,
+        old: cur
+      });
+    }
+  }
+
+  // ---------- Step 3: выдаём свободные номера сверху вниз ----------
+  const nextFree = set => { let k = 1; while (set.has(k)) k++; set.add(k); return k; };
+
+  perDay.forEach((bucket, ddmm) => {
+    const { used, reassign, generate } = bucket;
+    // Порядок: сначала чиним дубликаты, потом генерим отсутствующие
+    const queue = [
+      ...reassign.map(x => ({...x, kind: "reassign"})),
+      ...generate.map(x => ({...x, kind: "generate"}))
+    ].sort((a,b)=>a.i - b.i);
+
+    for (const item of queue) {
+      const i = item.i;
+      const before = String(newLabels[i][0] || "");
+      const num = nextFree(used);
+      const after = `4_${ddmm}_${num}`;
+      if (before !== after) {
+        newLabels[i][0] = after;
+        changed = true;
+        const reason =
+          item.kind === "reassign"
+            ? (item.conflictFrozen ? "reassigned_conflict_frozen" : "reassigned_duplicate")
+            : "generated_missing_or_invalid";
+        changes.push({ row: FIRST + i, ddmm, before, after, reason });
+      }
+    }
+  });
+
+  // ---------- Запись и логирование ----------
+  if (changed) {
+    sheet.getRange(FIRST, labelCol, n, 1).setValues(newLabels);
+  }
+
+  // Сводка по датам/причинам
+  const byDay = {};
+  for (const ch of changes) {
+    const key = ch.ddmm;
+    if (!byDay[key]) byDay[key] = {reassigned_conflict_frozen:0, reassigned_duplicate:0, generated_missing_or_invalid:0, cleared_ineligible_or_no_date:0};
+    byDay[key][ch.reason] = (byDay[key][ch.reason] || 0) + 1;
+  }
+
+  Logger.log(`🔧 process_lable repair (${sheet.getName()}): changed=${changed ? changes.length : 0}`);
+  Object.keys(byDay).sort().forEach(ddmm => {
+    const s = byDay[ddmm];
+    Logger.log(`  • ${ddmm}: reassign_conf_frozen=${s.reassigned_conflict_frozen||0}, reassign_dup=${s.reassigned_duplicate||0}, generated=${s.generated_missing_or_invalid||0}, cleared=${s.cleared_ineligible_or_no_date||0}`);
+  });
+
+  // Детализация (не более MAX_DETAIL строк)
+  const detailCnt = Math.min(changes.length, MAX_DETAIL);
+  for (let i = 0; i < detailCnt; i++) {
+    const c = changes[i];
+    Logger.log(`    #${i+1}: R${c.row} [${c.ddmm}] ${c.before || "∅"} → ${c.after || "∅"} (${c.reason})`);
+  }
+  if (changes.length > MAX_DETAIL) {
+    Logger.log(`    … truncated: ${changes.length - MAX_DETAIL} more changes`);
+  }
+
+  if (!changed) {
+    Logger.log(`✅ process_lable OK: ${sheet.getName()} (нет изменений)`);
+  } else {
+    Logger.log(`🧩 process_lable repaired: ${sheet.getName()} (total ${changes.length})`);
+  }
+}
+
+
+
+
+function isEligibleChannel_(ch) {
+  const s = (ch || "").toString().trim().toLowerCase();
+  return s === "wa/tg/sms" || s === "sms" || s === "whatsapp" || s === "telegram";
+}
+function isFrozenStatus_(st) {
+  const s = (st || "").toString().trim().toLowerCase();
+  return s === "согласована" || s === "выполнена" || s === "отменена";
+}
+function toDDMM_(v, tz) {
+  // Дата-объект → dd.MM
+  if (Object.prototype.toString.call(v) === "[object Date]") {
+    return Utilities.formatDate(v, tz || Session.getScriptTimeZone(), "dd.MM");
+  }
+  // Строки вида 11.08.2025 или 11.08 → dd.MM
+  const str = (v || "").toString().trim();
+  const m = /^(\d{2})\.(\d{2})(?:\.(\d{4}))?$/.exec(str);
+  if (m) return `${m[1]}.${m[2]}`;
+  return null;
+}
+function parseLabelNum_(lbl) {
+  const m = /^4_\d{2}\.\d{2}_(\d+)$/.exec((lbl || "").toString().trim());
+  return m ? parseInt(m[1], 10) : null;
+}
+function ddmmFromLabel_(lbl) {
+  const m = /^4_(\d{2}\.\d{2})_\d+$/.exec((lbl || "").toString().trim());
+  return m ? m[1] : null;
+}
+
+
