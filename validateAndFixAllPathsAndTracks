@@ -1,0 +1,94 @@
+function validateAndFixAllPathsAndTracks() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const kpsJson = scriptProperties.getProperty("active_kps");
+  if (!kpsJson) {
+    Logger.log("⚠ Нет активных КП в Script Properties.");
+    return;
+  }
+
+  const kps = JSON.parse(kpsJson);
+  const timeZone = Session.getScriptTimeZone();
+  const currentMonthYear = Utilities.formatDate(new Date(), timeZone, "MMMM_yyyy");
+
+  const headerMap = getHeaderMap_PathsAndTracks();
+  const valueMap = getValueMap_PathsAndTracks();
+
+  kps.forEach(kp => {
+    try {
+      const spreadsheet = SpreadsheetApp.openById(kp.id_work);
+      const sheets = spreadsheet.getSheets();
+
+      sheets.forEach(sheet => {
+        const sheetName = sheet.getName();
+        const monthYearRegex = /^[A-Za-z]+_\d{4}$/;
+        if (!monthYearRegex.test(sheetName) || sheetName !== currentMonthYear) return;
+
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        const headersRus = headers.map(h => toRusHeader_PathsAndTracks(h, headerMap));
+        const headerToIndex = name => headersRus.indexOf(name) + 1;
+
+        const pathCol = headerToIndex("Путь");
+        const trackCol = headerToIndex("Трек");
+        const statusCol = headerToIndex("Статус рассылки");
+
+        if (pathCol < 1 || trackCol < 1 || statusCol < 1) {
+          Logger.log("⚠ В листе " + sheetName + " нет необходимых столбцов.");
+          return;
+        }
+
+        const lastRow = sheet.getLastRow();
+        if (lastRow < 2) {
+          Logger.log("⚠ В листе " + sheetName + " нет данных для проверки.");
+          return;
+        }
+
+        const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+        const updates = [];
+
+        data.forEach((row, i) => {
+          const pathValue = row[pathCol - 1]?.toString().trim() || "";
+          const trackValue = row[trackCol - 1]?.toString().trim() || "";
+          const statusValueRaw = row[statusCol - 1]?.toString().trim() || "";
+          const statusValue = toRusValue_PathsAndTracks(statusValueRaw, valueMap);
+
+          if (trackValue && statusValue === "Согласована") {
+            const expectedStart = pathValue.includes("?") ? "&" : "?";
+            if (!trackValue.startsWith(expectedStart)) {
+              const correctedTrack = expectedStart + trackValue.replace(/^[&?]/, "");
+              updates.push([i + 2, trackCol, correctedTrack]);
+            }
+          }
+        });
+
+        if (updates.length > 0) {
+          updates.forEach(update => {
+            sheet.getRange(update[0], update[1]).setValue(update[2]);
+          });
+          Logger.log("✅ Исправлено " + updates.length + " ошибок в " + sheetName);
+        } else {
+          Logger.log("✅ В " + sheetName + " ошибок не найдено.");
+        }
+      });
+
+    } catch (error) {
+      Logger.log("❌ Ошибка обработки КП: " + kp.name + " → " + error);
+    }
+  });
+}
+
+
+function toRusHeader_PathsAndTracks(h, map) {
+  return Object.keys(map).includes(h) ? map[h] : h;
+}
+
+function toRusValue_PathsAndTracks(v, map) {
+  return Object.keys(map).includes(v) ? map[v] : v;
+}
+
+function getHeaderMap_PathsAndTracks() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty("header_map_eng_to_rus") || "{}");
+}
+
+function getValueMap_PathsAndTracks() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty("value_map_eng_to_rus") || "{}");
+}
