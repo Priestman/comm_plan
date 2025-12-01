@@ -1,0 +1,123 @@
+function syncToWorkBook(kpName) {
+  const kps = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден.`);
+
+  const currentMonth = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM_yyyy");
+
+  try {
+    const cleanSheet = SpreadsheetApp.openById(kp.id_clean).getSheetByName(currentMonth);
+    const workSheet = SpreadsheetApp.openById(kp.id_work).getSheetByName(currentMonth);
+    if (!cleanSheet || !workSheet) return Logger.log(`⚠ Нет листа ${currentMonth} в ${kpName}`);
+
+    const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+    const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+
+    const idColClean = cleanHeaders.indexOf("communication_id");
+    const idColWork = workHeaders.indexOf("communication_id");
+    const channelColWork = workHeaders.indexOf("Канал");
+
+    if (idColClean === -1 || idColWork === -1 || channelColWork === -1) {
+      return Logger.log(`⚠ Отсутствуют ключевые столбцы в ${kpName}`);
+    }
+
+    const cleanData = cleanSheet.getDataRange().getValues().slice(1);
+    const workData = workSheet.getDataRange().getValues();
+
+    const cleanMap = new Map();
+    cleanData.forEach(row => {
+      const id = row[idColClean];
+      if (id) cleanMap.set(id, row);
+    });
+
+    const firstPool = [
+      "Отправлено", "Доставлено", "Прочитано", "Спенд", "Клики",
+      "Уникальных юзеров с депозитом", "Кол-во депов", "Сумма депов",
+      "Сумма первых депозитов после перехода по треку", "ClickToDep",
+      "кол-во неуд депов", "сумма неуд депов", "Соотношение неуд к уд депы",
+      "Сумма HOLD (разница dep - cashout)", "Дата до которой нужно собирать данные по каналам"
+    ];
+    const secondPool = [
+      "Отправлено по группам", "Доставлено по группам", "Прочитано по группам", "Спенд по группам", "Клики по группам",
+      "Уникальных юзеров с депозитом по группам", "Кол-во депов по группам", "Сумма депов по группам",
+      "Сумма первых депозитов после перехода по треку по группам", "ClickToDep по группам",
+      "кол-во неуд депов по группам", "сумма неуд депов по группам",
+      "Соотношение неуд к уд депы по группам", "Сумма HOLD (разница dep - cashout) по группам",
+      "Дата до которой нужно собирать данные по группам"
+    ];
+    const allColumns = firstPool.concat(secondPool);
+
+    const workIndexes = allColumns.map(col => workHeaders.indexOf(col));
+    const cleanIndexes = allColumns.map(col => cleanHeaders.indexOf(col));
+
+    const firstIdx = Math.min(...workIndexes.filter(i => i !== -1));
+    const lastIdx = Math.max(...workIndexes.filter(i => i !== -1));
+    const numColsToUpdate = lastIdx - firstIdx + 1;
+
+    const excludedColumns = ["Отправлено", "Доставлено", "Спенд"];
+    const workIndexesSet = new Set(workIndexes.filter(i => i !== -1));
+
+    const workMap = new Map();
+    for (let i = 1; i < workData.length; i++) {
+      const id = workData[i][idColWork];
+      if (id) workMap.set(id, i);
+    }
+
+    const updates = [];
+    cleanMap.forEach((cleanRow, commId) => {
+      const workRowIndex = workMap.get(commId);
+      if (workRowIndex === undefined) return;
+
+      const channel = workData[workRowIndex][channelColWork];
+      const isExcludedChannel = channel === "Whatsapp" || channel === "SMS" || channel === "WA/TG/SMS" || channel === "Telegram BOT" ;
+
+      const rowValues = [];
+
+      for (let k = 0; k < numColsToUpdate; k++) {
+        const colIdx = firstIdx + k;
+        if (!workIndexesSet.has(colIdx)) {
+          rowValues.push(workData[workRowIndex][colIdx]);
+          continue;
+        }
+
+        const colName = workHeaders[colIdx];
+        const cleanIdx = cleanHeaders.indexOf(colName);
+        const cleanValue = cleanIdx !== -1 ? cleanRow[cleanIdx] : "";
+        const workValue = workData[workRowIndex][colIdx];
+
+        if (isExcludedChannel && excludedColumns.includes(colName)) {
+          // 🔒 Не трогаем SMS/Whatsapp поля "Отправлено", "Доставлено", "Спенд"
+          rowValues.push(workValue);
+        } else {
+          rowValues.push(cleanValue);
+        }
+      }
+
+      updates.push({ rowIndex: workRowIndex + 1, values: rowValues });
+    });
+
+    updates.sort((a, b) => a.rowIndex - b.rowIndex);
+
+    const groupedUpdates = [];
+    let currentGroup = [];
+    updates.forEach((update, index) => {
+      if (index === 0 || update.rowIndex === currentGroup[currentGroup.length - 1].rowIndex + 1) {
+        currentGroup.push(update);
+      } else {
+        groupedUpdates.push(currentGroup);
+        currentGroup = [update];
+      }
+    });
+    if (currentGroup.length > 0) groupedUpdates.push(currentGroup);
+
+    groupedUpdates.forEach(group => {
+      const startRow = group[0].rowIndex;
+      const values = group.map(u => u.values);
+      workSheet.getRange(startRow, firstIdx + 1, values.length, numColsToUpdate).setValues(values);
+    });
+
+    Logger.log(`✅ ${kpName}: Обновлено строк: ${updates.length}`);
+  } catch (e) {
+    Logger.log(`❌ Ошибка в ${kpName}: ${e}`);
+  }
+}
