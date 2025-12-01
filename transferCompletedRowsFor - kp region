@@ -1,0 +1,462 @@
+/**
+ * Жёсткий контроль дублей:
+ * - Если и comm_id, и track уже есть в чистовом → считаем, что строка уже перенесена: ставим "Перенесено в БД".
+ * - Если comm_id уже есть, но track другой → ОШИБКА, не переносим.
+ * - Если track уже есть, но comm_id другой → ОШИБКА, не переносим.
+ * - Если ни comm_id, ни track нет → переносим.
+ * Во всех сравнениях track берём после очистки (normalizeTrackId).
+ * Дополнительно: в прогон попадают все строки, КРОМЕ уже помеченных "Перенесено в БД".
+ * * НОВЫЕ ПРОВЕРКИ:
+ * - Обязательная заполненность критических полей
+ * - Проверка канала по справочнику
+ * - Усиленная валидация с email уведомлениями при ошибках
+ */
+function transferCompletedRowsFor(kpName) {
+  // 0) Проверяем доступность справочного файла и загружаем каналы
+  const validChannels = loadValidChannels();
+  
+  // 1) Актуализируем кэш чистового перед переносом
+  cacheCleanCommunicationIds();
+
+  const SP = PropertiesService.getScriptProperties();
+  const kps = JSON.parse(SP.getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден в ScriptProperties.`);
+
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+  const currentSheetName = Utilities.formatDate(now, tz, "MMMM_yyyy");
+  const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const previousSheetName = Utilities.formatDate(prevDate, tz, "MMMM_yyyy");
+
+  const sheetNamesToProcess = [currentSheetName, previousSheetName];
+
+  sheetNamesToProcess.forEach(sheetName => {
+    // 2) читаем кэш чистового по месяцу: { comm_id: {track, date}, ... }
+    let enrichedCache = {};
+    try {
+      const raw = SP.getProperty(`clean_ids_${sheetName}`);
+      enrichedCache = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      Logger.log(`⚠ Битый JSON в clean_ids_${sheetName}: ${e}. Использую пустой кэш.`);
+      enrichedCache = {};
+    }
+    // id и track наборы для быстрых проверок
+    const cachedIds = new Set(Object.keys(enrichedCache));
+    const cachedTracks = new Set(
+      Object.values(enrichedCache)
+        .map(e => normalizeTrackId(e && e.track))
+        .filter(Boolean)
+    );
+
+    try {
+      const workBook = SpreadsheetApp.openById(kp.id_work);
+      const cleanBook = SpreadsheetApp.openById(kp.id_clean);
+
+      const workSheet = workBook.getSheetByName(sheetName);
+      let cleanSheet = cleanBook.getSheetByName(sheetName);
+      if (!workSheet) return Logger.log(`⚠ Лист '${sheetName}' отсутствует в рабочем КП ${kpName}`);
+      if (!cleanSheet) cleanSheet = cleanBook.insertSheet(sheetName);
+
+      const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+      const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+
+      // 3) НОВАЯ ПРОВЕРКА: Существование критических столбцов
+      const criticalColumns = ["Дата", "Статус рассылки", "Время отправки по МСК", "Канал", "Направление", "communication_id", "Корректность строки", "Трек"];
+      const missingColumns = criticalColumns.filter(col => workHeaders.indexOf(col) === -1);
+      if (missingColumns.length > 0) {
+        Logger.log(`❌ В листе '${sheetName}' КП '${kpName}' отсутствуют критические столбцы: ${missingColumns.join(", ")}`);
+        sendErrorNotification(`Отсутствуют критические столбцы в КП ${kpName}, лист ${sheetName}`, `Отсутствующие столбцы: ${missingColumns.join(", ")}`);
+        return;
+      }
+
+      const statusCol = workHeaders.indexOf("Статус рассылки") + 1;
+      const correctnessCol = workHeaders.indexOf("Корректность строки") + 1;
+      const idCol = workHeaders.indexOf("communication_id") + 1;
+      const trackColIdx = workHeaders.indexOf("Трек"); // 0-based
+      if (statusCol < 1 || correctnessCol < 1 || idCol < 1 || trackColIdx < 0) return;
+
+      const lastRow = workSheet.getLastRow();
+      if (lastRow < 2) return;
+
+      const width = workSheet.getLastColumn();
+      const data = workSheet.getRange(2, 1, lastRow - 1, width).getValues();
+      const correctnessValues = workSheet.getRange(2, correctnessCol, lastRow - 1, 1).getValues();
+
+      // 4) Дубли в рабочем листе — по ОЧИЩЕННОМУ треку (не блокируют повторную проверку; будут перезаписаны)
+      const trackMap = new Map(); // cleanTrack -> [rowIdx...]
+      data.forEach((row, i) => {
+        const status = String(row[statusCol - 1] || "").trim();
+        const cleanTrack = normalizeTrackId(row[trackColIdx]);
+        // Берём в карту кандидатов "Выполнена" вне зависимости от прошлых ошибок
+        if (status === "Выполнена" && cleanTrack) {
+          if (!trackMap.has(cleanTrack)) trackMap.set(cleanTrack, [i]);
+          else trackMap.get(cleanTrack).push(i);
+        }
+      });
+      trackMap.forEach((rows, t) => {
+        if (rows.length > 1) {
+          Logger.log(`⚠ Дубли трека в рабочем (track_id=${t}) строки: ${rows.map(r => r + 2).join(", ")}`);
+          rows.forEach(i => correctnessValues[i][0] = `❌ Дублирование трека в рабочем (track_id=${t})`);
+        }
+      });
+
+      // 5) Основной цикл с логикой (ИЗМЕНЁН ПОРЯДОК ПРОВЕРОК)
+      const toTransfer = [];
+      const timestamp = Utilities.formatDate(new Date(), tz, "dd.MM.yyyy HH:mm:ss");
+      const batchIds = new Set();
+      const batchTracks = new Set();
+      let errorCount = 0;
+
+      data.forEach((row, i) => {
+        const communicationId = String(row[idCol - 1] || "").trim();
+        const status = String(row[statusCol - 1] || "").trim();
+        const existingCorrectness = String(correctnessValues[i][0] || "").trim();
+
+        // В прогон идут все, КРОМЕ уже помеченных "Перенесено в БД"
+        if (existingCorrectness === "Перенесено в БД") return;
+
+        // НОВЫЙ ПОРЯДОК: Сначала полная валидация, потом проверки дублей
+        
+        // 5.1) Проверка базовых условий для попадания в обработку
+        if (!communicationId || status !== "Выполнена") return; // Не ошибка, просто не готова к переносу
+
+        // 5.2) НОВАЯ УСИЛЕННАЯ ВАЛИДАЦИЯ (включая проверку канала по справочнику)
+        const validationErrors = validateRowEnhanced(row, workHeaders, validChannels);
+        if (validationErrors.length > 0) {
+          correctnessValues[i][0] = validationErrors.join("; ");
+          errorCount++;
+          return;
+        }
+
+        const cleanTrack = normalizeTrackId(row[trackColIdx]);
+
+        const idExists = cachedIds.has(communicationId);
+        const trackExists = cleanTrack && cachedTracks.has(cleanTrack);
+
+        // 5.3) Проверки дублей в чистовом
+        if (idExists && trackExists) {
+          if (existingCorrectness !== "Перенесено в БД") correctnessValues[i][0] = "Перенесено в БД";
+          return;
+        }
+        if (idExists && !trackExists) {
+          correctnessValues[i][0] = `❌ Дублирование communication_id в чистовом (id=${communicationId})`;
+          errorCount++;
+          return;
+        }
+        if (!idExists && trackExists) {
+          correctnessValues[i][0] = `❌ Дублирование трека в чистовом (track_id=${cleanTrack})`;
+          errorCount++;
+          return;
+        }
+
+        // 5.4) Внутрипакетные дубли в рамках одного запуска
+        if (batchIds.has(communicationId)) {
+          correctnessValues[i][0] = `❌ Дублирование communication_id в текущей партии (${communicationId})`;
+          errorCount++;
+          return;
+        }
+        if (cleanTrack && batchTracks.has(cleanTrack)) {
+          correctnessValues[i][0] = `❌ Дублирование трека в текущей партии (track_id=${cleanTrack})`;
+          errorCount++;
+          return;
+        }
+
+        // 5.5) Дополнительная проверка ссылки
+        const expectedLink = constructLinkAndTrack(row, workHeaders, workSheet, i + 2);
+        const linkIdx = workHeaders.indexOf("Ссылка + трек");
+        const actualLink = linkIdx >= 0 ? row[linkIdx] : "";
+        if (actualLink && expectedLink && actualLink !== expectedLink) {
+          correctnessValues[i][0] = "❌ Некорректная Ссылка + трек";
+          errorCount++;
+          return;
+        }
+
+        // Формируем строку для чистового (Трек — уже очищенный id)
+        const newRow = cleanHeaders.map(header => {
+          const idx = workHeaders.indexOf(header);
+          if (idx > -1) {
+            let value = row[idx];
+            if (header === "Трек") value = normalizeTrackId(value);        // <-- только id
+            if (header === "process_lable") value = filterProcessLable(row, workHeaders);
+            return value;
+          } else if (header === "moving_date") {
+            return timestamp;
+          } else {
+            return "";
+          }
+        });
+
+        toTransfer.push(newRow);
+        correctnessValues[i][0] = "Перенесено в БД";
+
+        // Фиксируем в батче
+        batchIds.add(communicationId);
+        if (cleanTrack) batchTracks.add(cleanTrack);
+      });
+
+      // 6) Запись и обновление кэша
+      if (toTransfer.length > 0) {
+        const startRow = Math.max(2, cleanSheet.getLastRow() + 1);
+        cleanSheet.getRange(startRow, 1, toTransfer.length, cleanHeaders.length).setValues(toTransfer);
+        SpreadsheetApp.flush();
+        
+        // Обновляем кэш (храним нормализованный track)
+        const idxId = cleanHeaders.indexOf("communication_id");
+        const idxTrack = cleanHeaders.indexOf("Трек");
+        const idxDate = cleanHeaders.indexOf("moving_date");
+        toTransfer.forEach(r => {
+          const id = String(r[idxId] || "").trim();
+          const tr = normalizeTrackId(r[idxTrack]);
+          const dt = r[idxDate];
+          if (id && tr && dt) {
+            enrichedCache[id] = { track: tr, date: dt };
+            cachedIds.add(id);
+            cachedTracks.add(tr);
+          }
+        });
+        SP.setProperty(`clean_ids_${sheetName}`, JSON.stringify(enrichedCache));
+      }
+
+      // 7) Применяем статусы корректности
+      workSheet.getRange(2, correctnessCol, lastRow - 1, 1).setValues(correctnessValues);
+
+      // 8) НОВОЕ: Логирование сводки
+      Logger.log(`📊 КП '${kpName}', лист '${sheetName}': обработано ${data.length} строк, перенесено ${toTransfer.length}, ошибок ${errorCount}`);
+
+    } catch (error) {
+      Logger.log(`❌ Ошибка переноса для КП '${kpName}', лист '${sheetName}': ${error}`);
+      sendErrorNotification(`Ошибка переноса КП ${kpName}, лист ${sheetName}`, error.toString());
+    }
+  });
+}
+
+/* ===================== НОВЫЕ ФУНКЦИИ ===================== */
+
+/**
+ * Загружает справочник допустимых каналов
+ * @returns {Set|null} Set с допустимыми каналами или null при ошибке
+ */
+function loadValidChannels() {
+  try {
+    const referenceFileId = "1JHFCWOj4A82dSNeLHb68B5JHHPxfvHHxg8_e4tjjQtY";
+    const referenceBook = SpreadsheetApp.openById(referenceFileId);
+    const referenceSheet = referenceBook.getSheetByName("reference_channel_N");
+    
+    if (!referenceSheet) {
+      throw new Error("Лист 'reference_channel_N' не найден в справочном файле");
+    }
+    
+    const channelColIndex = referenceSheet.getRange(1, 1, 1, referenceSheet.getLastColumn())
+      .getValues()[0].indexOf("Канал");
+    
+    if (channelColIndex === -1) {
+      throw new Error("Столбец 'Канал' не найден в справочном листе");
+    }
+    
+    const lastRow = referenceSheet.getLastRow();
+    if (lastRow < 2) {
+      throw new Error("Справочный лист пуст (нет данных кроме заголовка)");
+    }
+    
+    const channelValues = referenceSheet.getRange(2, channelColIndex + 1, lastRow - 1, 1).getValues();
+    const validChannels = new Set();
+    
+    channelValues.forEach(row => {
+      const channel = String(row[0] || "").trim();
+      if (channel) validChannels.add(channel);
+    });
+    
+    Logger.log(`✅ Загружено ${validChannels.size} допустимых каналов из справочника`);
+    return validChannels;
+    
+  } catch (error) {
+    Logger.log(`❌ Ошибка загрузки справочника каналов: ${error}`);
+    sendErrorNotification("Ошибка загрузки справочника каналов", error.toString());
+    return null;
+  }
+}
+
+/**
+ * Отправляет email уведомление об ошибке
+ * @param {string} subject - Тема письма
+ * @param {string} body - Текст письма
+ */
+function sendErrorNotification(subject, body) {
+  try {
+    const recipients = "alisa.rumyantseva@1win.pro,rostislav.shevchenko@1win.pro";
+    const fullSubject = `[КП Система] ${subject}`;
+    const fullBody = `Произошла ошибка в системе переноса данных КП:
+
+${body}
+
+Время: ${new Date()}
+Функция: transferCompletedRowsFor()
+
+Требуется проверка системы.`;
+
+    GmailApp.sendEmail(recipients, fullSubject, fullBody);
+    Logger.log(`📧 Отправлено уведомление об ошибке: ${subject}`);
+  } catch (emailError) {
+    Logger.log(`❌ Ошибка отправки email уведомления: ${emailError}`);
+  }
+}
+
+/**
+ * НОВАЯ УСИЛЕННАЯ ВАЛИДАЦИЯ с проверкой критических полей и справочника каналов
+ * @param {Array} row - Данные строки
+ * @param {Array} headers - Заголовки
+ * @param {Set|null} validChannels - Набор допустимых каналов
+ * @returns {Array} Массив ошибок
+ */
+function validateRowEnhanced(row, headers, validChannels) {
+  const errors = [];
+
+  // 1) НОВАЯ ПРОВЕРКА: Критические поля (должны быть заполнены)
+  const criticalFields = ["Дата", "Статус рассылки", "Время отправки по МСК", "Канал", "Направление"];
+  
+  criticalFields.forEach(field => {
+    const idx = headers.indexOf(field);
+    if (idx === -1) {
+      errors.push(`❌ Отсутствует столбец: ${field}`);
+    } else if (!row[idx] || row[idx].toString().trim() === "") {
+      errors.push(`❌ Не заполнено поле: ${field}`);
+    }
+  });
+
+  // 2) НОВАЯ ПРОВЕРКА: Канал по справочнику
+  const channelIdx = headers.indexOf("Канал");
+  if (channelIdx > -1 && validChannels) {
+    const channel = String(row[channelIdx] || "").trim();
+    if (channel && !validChannels.has(channel)) {
+      errors.push(`❌ Недопустимое значение канала: ${channel}`);
+    }
+  }
+
+  // 3) Остальные обязательные поля (существующая логика)
+  const remainingRequired = [
+    "communication_id", "День недели", "Тема рассылки", "ГЕО", "Группа сегментов",
+    "Подсегмент", "Тесты", "Трек", "Название сегмента в CDP"
+  ];
+
+  remainingRequired.forEach(field => {
+    const idx = headers.indexOf(field);
+    if (idx === -1) {
+      errors.push(`❌ Отсутствует столбец: ${field}`);
+    } else if (!row[idx] || row[idx].toString().trim() === "") {
+      errors.push(`❌ Пропущено поле: ${field}`);
+    }
+  });
+
+  // 4) Специальные условия
+  const chIdx = headers.indexOf("Канал");
+  const nIdx = headers.indexOf("Тип нотифа");
+  const pIdx = headers.indexOf("process_lable");
+
+  if (chIdx > -1) {
+    const channel = row[chIdx]?.toString().trim();
+    const notifType = nIdx > -1 ? row[nIdx]?.toString().trim() : "";
+    const label = pIdx > -1 ? row[pIdx]?.toString().trim() : "";
+
+    if (channel === "Notification" && !notifType) errors.push("❌ 'Тип нотифа' обязателен");
+    if (channel !== "Notification" && notifType) errors.push("❌ 'Тип нотифа' должно быть пустым");
+    // KakaoTalk здесь уже добавлен в вашем исходном скрипте
+    if ((channel === "Whatsapp" || channel === "SMS" || channel === "WA/TG/SMS" || channel === "Viber"|| channel === "KakaoTalk") && !label) errors.push("❌ 'process_lable' обязателен");
+    if (channel !== "Whatsapp" && channel !== "SMS" && channel !== "WA/TG/SMS" && channel !== "Viber"  && channel !== "KakaoTalk" && label) errors.push("❌ 'process_lable' должно быть пустым");
+  }
+
+  return errors;
+}
+
+/* ===================== Поддержка (с изменениями для KakaoTalk) ===================== */
+
+// Единая нормализация треков: вытягиваем trid=<id> из URL,
+// иначе берём «похожий на id» токен (буквы+цифры), иначе — строку без пробелов.
+function normalizeTrackId(track) {
+  if (track == null) return "";
+  const s = String(track).trim();
+
+  const mUrl = s.match(/(?:[?&;])trid=([^&#;,\s]+)/i);
+  if (mUrl && mUrl[1]) return decodeURIComponent(mUrl[1].trim());
+
+  const mToken = s.match(/\b([A-Za-z]{2,12}\d{5,})\b/); // aztr072500001 / asia12591083
+  if (mToken && mToken[1]) return mToken[1];
+
+  return s.replace(/\s+/g, "");
+}
+
+// Оставлено для совместимости: теперь просто вызывает normalizeTrackId
+function extractTrackIdTransfer(track) {
+  return normalizeTrackId(track);
+}
+
+// 🎯 Валидация обязательных полей + спец. условий (ОБНОВЛЕНО: добавлен KakaoTalk)
+function validateRow(row, headers) {
+  // Эта функция оставлена для совместимости, но теперь используется validateRowEnhanced
+  const required = [
+    "communication_id", "Дата", "День недели", "Статус рассылки", "Время отправки по МСК",
+    "Канал", "Направление", "Тема рассылки", "ГЕО", "Группа сегментов",
+    "Подсегмент", "Тесты", "Трек", "Название сегмента в CDP"
+  ];
+
+  const errors = [];
+
+  required.forEach(field => {
+    const idx = headers.indexOf(field);
+    if (idx > -1 && (!row[idx] || row[idx].toString().trim() === "")) {
+      errors.push("❌ Пропущено поле: " + field);
+    }
+  });
+
+  const chIdx = headers.indexOf("Канал");
+  const nIdx = headers.indexOf("Тип нотифа");
+  const pIdx = headers.indexOf("process_lable");
+
+  if (chIdx > -1) {
+    const channel = row[chIdx]?.toString().trim();
+    const notifType = nIdx > -1 ? row[nIdx]?.toString().trim() : "";
+    const label = pIdx > -1 ? row[pIdx]?.toString().trim() : "";
+
+    if (channel === "Notification" && !notifType) errors.push("❌ 'Тип нотифа' обязателен");
+    if (channel !== "Notification" && notifType) errors.push("❌ 'Тип нотифа' должно быть пустым");
+    // Добавлен KakaoTalk
+    if ((channel === "Whatsapp" || channel === "SMS" || channel === "WA/TG/SMS" || channel === "Viber" || channel === "KakaoTalk") && !label) errors.push("❌ 'process_lable' обязателен");
+    // Добавлен KakaoTalk
+    if (channel !== "Whatsapp" && channel !== "SMS" && channel !== "WA/TG/SMS" && channel !== "Viber" && channel !== "KakaoTalk" && label) errors.push("❌ 'process_lable' должно быть пустым");
+  }
+
+  return errors;
+}
+
+// 🔧 Формирование ссылки (без изменений)
+function constructLinkAndTrack(row, headers, sheet, rowIndex) {
+  const m = headers.indexOf("Зеркало"),
+        p = headers.indexOf("Путь"),
+        t = headers.indexOf("Трек");
+
+  const mirror = sheet.getRange(rowIndex, m + 1).getFormula() || row[m] || "";
+  const path = row[p] || "";
+  const track = row[t] || "";
+
+  if (!mirror) return path + track;
+  if (!path) return mirror + track;
+  return mirror + path + track;
+}
+
+// 🔧 process_lable (ОБНОВЛЕНО: добавлен KakaoTalk для переноса значения)
+function filterProcessLable(row, headers) {
+  const c = headers.indexOf("Канал"),
+        p = headers.indexOf("process_lable");
+
+  if (c > -1 && p > -1) {
+    const channel = row[c]?.toString().trim();
+    const value = row[p];
+    // Добавлен KakaoTalk
+    if (channel === "Whatsapp" || channel === "SMS" || channel === "WA/TG/SMS" || channel === "Viber" || channel === "KakaoTalk") return value;
+  }
+  return "";
+}
+
+function transferCompletedRowsFor_TEST() {
+  transferCompletedRowsFor("TEST");
+}
