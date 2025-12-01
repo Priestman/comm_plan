@@ -1,0 +1,28 @@
+function updateGeoListCache() {
+    var settingsFileId = "1JHFCWOj4A82dSNeLHb68B5JHHPxfvHHxg8_e4tjjQtY"; // ID главного файла
+    var geoSheet = SpreadsheetApp.openById(settingsFileId).getSheetByName("geo_list");
+
+    var geoData = geoSheet.getDataRange().getValues();
+    var allowedGeo = [];
+    var geoGroups = {}; // { "Asia list": "KG, VE" }
+
+    for (var i = 1; i < geoData.length; i++) {
+        var geoCode = geoData[i][0];
+        var description = geoData[i][1];
+
+        if (geoCode) {
+            allowedGeo.push(geoCode.trim());
+            if (description) {
+                geoGroups[geoCode.trim()] = description.trim();
+            }
+        }
+    }
+
+    var cacheData = {
+        allowedGeo: allowedGeo,
+        geoGroups: geoGroups
+    };
+
+    PropertiesService.getScriptProperties().setProperty("geo_list_data", JSON.stringify(cacheData));
+    Logger.log("✅ geo_list обновлён в `Script Properties`.");
+}
