@@ -1,0 +1,226 @@
+/**
+ * Синхронизирует данные между чистой и рабочей таблицами для указанного КП и месяца.
+ * Не перезаписывает столбцы "Отправлено", "Доставлено", "Спенд" для каналов "Whatsapp" и "SMS".
+ * @param {string} kpName - Название контент плана (КП).
+ * @param {string} month - Название месяца в формате "MMMM_yyyy".
+ */
+function syncDataForMonth(kpName, month) {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const kps = JSON.parse(scriptProperties.getProperty("active_kps") || "[]");
+  const headerMap = getHeaderMap();
+  const valueMap = getValueMap();
+
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден.`);
+
+  try {
+    const cleanSheet = SpreadsheetApp.openById(kp.id_clean).getSheetByName(month);
+    const workSheet = SpreadsheetApp.openById(kp.id_work).getSheetByName(month);
+    if (!cleanSheet || !workSheet) return Logger.log(`⚠ Нет листа ${month} в ${kpName}`);
+
+    const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+    const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+
+    const rusCleanHeaders = cleanHeaders.map(h => toRusHeader(h, headerMap));
+    const rusWorkHeaders = workHeaders.map(h => toRusHeader(h, headerMap));
+
+    const idColClean = rusCleanHeaders.indexOf("communication_id");
+    const idColWork = rusWorkHeaders.indexOf("communication_id");
+    if (idColClean === -1 || idColWork === -1) return Logger.log(`⚠ Нет communication_id в ${kpName} для ${month}`);
+
+    const channelColWork = rusWorkHeaders.indexOf("Канал");
+    if (channelColWork === -1) return Logger.log(`⚠ Нет столбца 'Канал' в ${kpName} для ${month}`);
+
+    const cleanData = cleanSheet.getDataRange().getValues().slice(1);
+    const workData = workSheet.getDataRange().getValues();
+
+    const cleanMap = new Map();
+    cleanData.forEach(row => {
+      const id = row[idColClean];
+      if (id) cleanMap.set(id, row);
+    });
+
+    const firstPool = [
+      "Отправлено", "Доставлено", "Прочитано", "Спенд", "Клики",
+      "Уникальных юзеров с депозитом", "Кол-во депов", "Сумма депов",
+      "Сумма первых депозитов после перехода по треку", "ClickToDep",
+      "кол-во неуд депов", "сумма неуд депов", "Соотношение неуд к уд депы",
+      "Сумма HOLD (разница dep - cashout)", "Дата до которой нужно собирать данные по каналам", "DeliveryRate", "ClickRate", "CRtoDep", "Доходность (dep)", "ROMI (dep)"
+    ];
+    const secondPool = firstPool.map(name => name + " по группам");
+    const allColumns = firstPool.concat(secondPool);
+
+    const workIndexes = allColumns.map(name => rusWorkHeaders.indexOf(name));
+    const cleanIndexes = allColumns.map(name => rusCleanHeaders.indexOf(name));
+    const firstIdx = Math.min(...workIndexes.filter(i => i !== -1));
+    const lastIdx = Math.max(...workIndexes.filter(i => i !== -1));
+    const numColsToUpdate = lastIdx - firstIdx + 1;
+    const workIndexesSet = new Set(workIndexes.filter(i => i !== -1));
+
+    const workMap = new Map();
+    for (let i = 1; i < workData.length; i++) {
+      const id = workData[i][idColWork];
+      if (id) workMap.set(id, i);
+    }
+
+    const updates = [];
+    cleanMap.forEach((cleanRow, commId) => {
+      const workRowIndex = workMap.get(commId);
+      if (workRowIndex === undefined) return;
+
+      const channelRaw = workData[workRowIndex][channelColWork];
+      const channel = toRusValue(channelRaw, valueMap);
+      const isExcluded = ["Whatsapp", "SMS", "Telegram BOT", "Звонобот", "Greymail"].includes(channel);
+
+      const rowValues = [];
+      for (let k = 0; k < numColsToUpdate; k++) {
+        const colIdx = firstIdx + k;
+        if (!workIndexesSet.has(colIdx)) {
+          rowValues.push(workData[workRowIndex][colIdx]);
+          continue;
+        }
+
+        const colName = rusWorkHeaders[colIdx];
+        const cleanIdx = rusCleanHeaders.indexOf(colName);
+        const cleanValue = cleanIdx !== -1 ? cleanRow[cleanIdx] : "";
+        const workValue = workData[workRowIndex][colIdx];
+
+        const isSpecialCol = ["Отправлено", "Доставлено", "Спенд"].includes(colName);
+
+        if (isExcluded && isSpecialCol) {
+          const isWorkEmpty = workValue === "" || workValue === null || workValue === 0 || workValue === "0";
+          const isCleanValid = cleanValue !== "" && cleanValue !== null && cleanValue !== 0 && cleanValue !== "0";
+
+          if (isWorkEmpty && isCleanValid) {
+            rowValues.push(cleanValue);
+          } else {
+            rowValues.push(workValue);
+          }
+        } else {
+          rowValues.push(cleanValue);
+        }
+      }
+
+      updates.push({ rowIndex: workRowIndex + 1, values: rowValues });
+    });
+
+    updates.sort((a, b) => a.rowIndex - b.rowIndex);
+    const groupedUpdates = [];
+    let currentGroup = [];
+    updates.forEach((u, i) => {
+      if (i === 0 || u.rowIndex === currentGroup[currentGroup.length - 1].rowIndex + 1) {
+        currentGroup.push(u);
+      } else {
+        groupedUpdates.push(currentGroup);
+        currentGroup = [u];
+      }
+    });
+    if (currentGroup.length > 0) groupedUpdates.push(currentGroup);
+
+    groupedUpdates.forEach(group => {
+      const startRow = group[0].rowIndex;
+      const values = group.map(u => u.values);
+      workSheet.getRange(startRow, firstIdx + 1, values.length, numColsToUpdate).setValues(values);
+    });
+
+    Logger.log(`✅ ${kpName} - ${month}: Обновлено строк: ${updates.length}`);
+  } catch (e) {
+    Logger.log(`❌ Ошибка в ${kpName} - ${month}: ${e}`);
+  }
+}
+
+
+/**
+ * Синхронизирует данные для указанного КП, обрабатывая текущий, предыдущий и позапрошлый месяцы.
+ * @param {string} kpName - Название контент плана (КП).
+ */
+function syncDataFor(kpName) {
+  const currentDate = new Date();
+  const currentMonth = Utilities.formatDate(currentDate, Session.getScriptTimeZone(), "MMMM_yyyy");
+
+  // Определяем дату 1 апреля 2025 года
+  const april2025 = new Date(2025, 3, 1); // Месяцы в JS начинаются с 0: 3 - апрель
+
+  // Список месяцев для обработки (по умолчанию только текущий)
+  const monthsToSync = [currentMonth];
+
+  // Если дата >= 1 апреля 2025 года, добавляем предыдущий и позапрошлый месяцы
+  if (currentDate >= april2025) {
+    const previousDate = new Date(currentDate);
+    previousDate.setMonth(previousDate.getMonth() - 1);
+    const previousMonth = Utilities.formatDate(previousDate, Session.getScriptTimeZone(), "MMMM_yyyy");
+
+    const twoMonthsAgoDate = new Date(currentDate);
+    twoMonthsAgoDate.setMonth(twoMonthsAgoDate.getMonth() - 2);
+    const twoMonthsAgo = Utilities.formatDate(twoMonthsAgoDate, Session.getScriptTimeZone(), "MMMM_yyyy");
+
+    monthsToSync.unshift(previousMonth); // Добавляем предыдущий месяц перед текущим
+    monthsToSync.unshift(twoMonthsAgo); // Добавляем позапрошлый месяц перед предыдущим
+  }
+
+  // Обрабатываем каждый месяц из списка
+  monthsToSync.forEach(month => {
+    syncDataForMonth(kpName, month);
+  });
+}
+
+function toRusHeader(h, map) {
+  return Object.keys(map).includes(h) ? map[h] : h;
+}
+
+function toRusValue(v, map) {
+  return Object.keys(map).includes(v) ? map[v] : v;
+}
+
+function getHeaderMap() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty("header_map_eng_to_rus") || "{}");
+}
+
+function getValueMap() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty("value_map_eng_to_rus") || "{}");
+}
+
+
+function syncDataFor_ASIA() {
+  syncDataFor("ASIA");
+}
+
+function syncDataFor_VIP() {
+  syncDataFor("VIP");
+}
+
+function syncDataFor_CIS() {
+  syncDataFor("CIS");
+}
+
+function syncDataFor_MASS() {
+  syncDataFor("MASS");
+}
+
+function syncDataFor_EXTERNAL() {
+  syncDataFor("EXTERNAL");
+}
+
+function syncDataFor_CC() {
+  syncDataFor("CC");
+}
+
+function syncDataFor_LATAM() {
+  syncDataFor("LATAM");
+}
+
+function syncDataFor_MEXICO() {
+  syncDataFor("MEXICO");
+}
+
+function syncDataFor_AFRICA() {
+  syncDataFor("AFRICA");
+}
+
+function syncDataFor_NIGERIA() {
+  syncDataFor("NIGERIA");
+}
+
+function syncDataFor_AZTR() {
+  syncDataFor("AZTR");
+}
