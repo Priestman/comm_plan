@@ -1,0 +1,101 @@
+
+function backfillMetricsForAll() {
+  const kps = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]");
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+
+  const currentMonth = Utilities.formatDate(now, tz, "MMMM_yyyy");
+  const months = [currentMonth];
+
+  const april2025 = new Date(2025, 3, 1); // апрель = 3
+  if (now >= april2025) {
+    const prev = new Date(now);
+    prev.setMonth(prev.getMonth() - 1);
+    const prevMonth = Utilities.formatDate(prev, tz, "MMMM_yyyy");
+    months.unshift(prevMonth);
+  }
+
+  months.forEach(month => {
+    kps.forEach(kp => backfillMetricsFromWorkToClean(kp.name, month));
+  });
+}
+
+
+function backfillMetricsFromWorkToClean(kpName, month) {
+  const kps = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]");
+  const kp = kps.find(k => k.name === kpName);
+  if (!kp) return Logger.log(`⚠ КП '${kpName}' не найден.`);
+
+  try {
+    const cleanSheet = SpreadsheetApp.openById(kp.id_clean).getSheetByName(month);
+    const workSheet = SpreadsheetApp.openById(kp.id_work).getSheetByName(month);
+    if (!cleanSheet || !workSheet) return Logger.log(`⚠ Нет листа ${month} в ${kpName}`);
+
+    const cleanHeaders = cleanSheet.getRange(1, 1, 1, cleanSheet.getLastColumn()).getValues()[0];
+    const workHeaders = workSheet.getRange(1, 1, 1, workSheet.getLastColumn()).getValues()[0];
+
+    const idColClean = cleanHeaders.indexOf("communication_id");
+    const idColWork = workHeaders.indexOf("communication_id");
+    const channelColClean = cleanHeaders.indexOf("Канал");
+
+    if (idColClean === -1 || idColWork === -1 || channelColClean === -1) {
+      return Logger.log(`⚠ Не найдены необходимые колонки в ${kpName} - ${month}`);
+    }
+
+    const cleanData = cleanSheet.getDataRange().getValues(); // включая заголовки
+    const workData = workSheet.getDataRange().getValues();
+
+    const cleanMap = new Map();
+    for (let i = 1; i < cleanData.length; i++) {
+      const id = cleanData[i][idColClean];
+      if (id) cleanMap.set(id, { row: i, data: cleanData[i] });
+    }
+
+    const fields = ["Отправлено", "Доставлено", "Спенд"];
+    const updates = [];
+
+    for (let i = 1; i < workData.length; i++) {
+      const id = workData[i][idColWork];
+      if (!id || !cleanMap.has(id)) continue;
+
+      const cleanEntry = cleanMap.get(id);
+      const cleanRow = cleanEntry.data;
+      const cleanRowIndex = cleanEntry.row;
+      const channel = cleanRow[channelColClean]?.toString().trim();
+
+      if (channel !== "Whatsapp" && channel !== "SMS" && channel !== "Звонобот" && channel !== "Telegram BOT") continue;
+
+      const rowUpdate = [...cleanRow];
+      let changed = false;
+
+      for (const field of fields) {
+        const workIdx = workHeaders.indexOf(field);
+        const cleanIdx = cleanHeaders.indexOf(field);
+        if (workIdx === -1 || cleanIdx === -1) continue;
+
+        const workVal = workData[i][workIdx];
+        const cleanVal = cleanRow[cleanIdx];
+
+        const isCleanEmpty = cleanVal === "" || cleanVal === null || Number(cleanVal) === 0;
+        const isWorkValid = workVal !== "" && workVal !== null && !isNaN(workVal) && Number(workVal) !== 0;
+
+        if (isCleanEmpty && isWorkValid) {
+          rowUpdate[cleanIdx] = workVal;
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        updates.push({ row: cleanRowIndex + 1, values: rowUpdate });
+      }
+    }
+
+    updates.forEach(update => {
+      cleanSheet.getRange(update.row, 1, 1, update.values.length).setValues([update.values]);
+    });
+
+    Logger.log(`✅ ${kpName} - ${month}: Обновлено строк: ${updates.length}`);
+  } catch (err) {
+    Logger.log(`❌ Ошибка в ${kpName} - ${month}: ${err}`);
+  }
+}
