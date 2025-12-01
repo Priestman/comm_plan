@@ -1,0 +1,190 @@
+function updateMetrics() {
+  // Определяем текущий и предыдущий месяц
+  const today = new Date();
+  const currentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  const previousMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  
+  // Форматируем названия листов
+  const currentSheetName = formatSheetName(currentMonth);
+  const previousSheetName = formatSheetName(previousMonth);
+  
+  console.log(`Обрабатываем листы: ${currentSheetName}, ${previousSheetName}`);
+  
+  // Обрабатываем оба листа
+  processSheet(currentSheetName);
+  processSheet(previousSheetName);
+  
+  console.log('Обработка завершена');
+}
+
+function formatSheetName(date) {
+  const months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+  return `${months[date.getMonth()]}_${date.getFullYear()}`;
+}
+
+function processSheet(sheetName) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  
+  try {
+    const sheet = spreadsheet.getSheetByName(sheetName);
+    if (!sheet) {
+      console.log(`Лист ${sheetName} не найден`);
+      return;
+    }
+    
+    console.log(`Обрабатываем лист: ${sheetName}`);
+    
+    // Получаем заголовки (первая строка)
+    const headerRange = sheet.getRange(1, 1, 1, sheet.getLastColumn());
+    const headers = headerRange.getValues()[0];
+    
+    // Определяем соответствие между внутренними названиями и заголовками колонок
+    const columnMappings = {
+      'Отправлено': 'AC',
+      'Доставлено': 'AD',
+      'Клики': 'AG',
+      'Уникальных юзеров с депозитом': 'AH',
+      'Спенд': 'AF',
+      'Сумма депов': 'AJ'
+    };
+    
+    // Находим индексы исходных колонок по их названиям в заголовках
+    const sourceColumns = {};
+    const missingSourceColumns = [];
+    
+    for (const [headerName, internalName] of Object.entries(columnMappings)) {
+      const index = findColumnIndex(headers, headerName);
+      if (index === -1) {
+        missingSourceColumns.push(headerName);
+      } else {
+        sourceColumns[internalName] = index;
+      }
+    }
+    
+    if (missingSourceColumns.length > 0) {
+      console.log(`В листе ${sheetName} не найдены исходные колонки: ${missingSourceColumns.join(', ')}`);
+      return;
+    }
+    
+    // Находим целевые колонки по названиям в заголовках
+    const targetColumns = {
+      deliveryRate: findColumnIndex(headers, 'DeliveryRate'),
+      clickRate: findColumnIndex(headers, 'ClickRate'),
+      crToDep: findColumnIndex(headers, 'CRtoDep'),
+      income: findColumnIndex(headers, 'Доходность (dep)'),
+      romi: findColumnIndex(headers, 'ROMI (dep)')
+    };
+    
+    // Проверяем, что целевые колонки найдены
+    const missingTargetColumns = Object.entries(targetColumns)
+      .filter(([key, value]) => value === -1)
+      .map(([key]) => key);
+    
+    if (missingTargetColumns.length > 0) {
+      console.log(`В листе ${sheetName} не найдены целевые колонки: ${missingTargetColumns.join(', ')}`);
+      return;
+    }
+    
+    // Определяем последнюю строку с данными
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      console.log(`В листе ${sheetName} нет данных для обработки`);
+      return;
+    }
+    
+    // Получаем все данные одним запросом
+    const dataRange = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
+    const data = dataRange.getValues();
+    
+    // Массивы для записи результатов
+    const deliveryRateValues = [];
+    const clickRateValues = [];
+    const crToDepValues = [];
+    const incomeValues = [];
+    const romiValues = [];
+    
+    // Обрабатываем каждую строку
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      
+      // Получаем исходные значения по найденным индексам
+      const ac = row[sourceColumns.AC];    // Отправлено
+      const ad = row[sourceColumns.AD];    // Доставлено  
+      const ag = row[sourceColumns.AG];    // Клики
+      const ah = row[sourceColumns.AH];    // Уникальный
+      const af = row[sourceColumns.AF];    // Спенд
+      const aj = row[sourceColumns.AJ];    // Сумма деп
+      
+      // Вычисляем метрики
+      // DeliveryRate = AD/AC
+      deliveryRateValues.push([calculateRatio(ad, ac)]);
+      
+      // ClickRate = AG/AD
+      clickRateValues.push([calculateRatio(ag, ad)]);
+      
+      // CRtoDep = AH/AG  
+      crToDepValues.push([calculateRatio(ah, ag)]);
+      
+      // Доходность = (AJ-AF)/AC
+      incomeValues.push([calculateRatio(aj - af, ac)]);
+      
+      // ROMI (dep) = (AJ-AF)/AF
+      romiValues.push([calculateRatio(aj - af, af)]);
+    }
+    
+    // Записываем результаты
+    if (deliveryRateValues.length > 0) {
+      sheet.getRange(2, targetColumns.deliveryRate + 1, deliveryRateValues.length, 1).setValues(deliveryRateValues);
+      sheet.getRange(2, targetColumns.clickRate + 1, clickRateValues.length, 1).setValues(clickRateValues);
+      sheet.getRange(2, targetColumns.crToDep + 1, crToDepValues.length, 1).setValues(crToDepValues);
+      sheet.getRange(2, targetColumns.income + 1, incomeValues.length, 1).setValues(incomeValues);
+      sheet.getRange(2, targetColumns.romi + 1, romiValues.length, 1).setValues(romiValues);
+    }
+    
+    console.log(`Лист ${sheetName} обработан: ${data.length} строк`);
+    
+  } catch (error) {
+    console.error(`Ошибка при обработке листа ${sheetName}:`, error);
+  }
+}
+
+function findColumnIndex(headers, columnName) {
+  for (let i = 0; i < headers.length; i++) {
+    if (headers[i] === columnName) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function calculateRatio(numerator, denominator) {
+  // Проверяем на пустые значения
+  if (numerator === '' || numerator === null || numerator === undefined ||
+      denominator === '' || denominator === null || denominator === undefined) {
+    return '';
+  }
+  
+  // Конвертируем в числа
+  const num = parseFloat(numerator);
+  const den = parseFloat(denominator);
+  
+  // Проверяем на корректность чисел
+  if (isNaN(num) || isNaN(den)) {
+    return '';
+  }
+  
+  // Обрабатываем деление на ноль
+  if (den === 0) {
+    return '#DIV/0!';
+  }
+  
+  return num / den;
+}
+
+// Дополнительная функция для ручного запуска с конкретным листом
+function updateMetricsForSheet(sheetName) {
+  processSheet(sheetName);
+}
