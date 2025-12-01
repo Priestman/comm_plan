@@ -1,0 +1,172 @@
+function regenerateDuplicateCommunicationIds() {
+  Logger.log("🚀 [START] regenerateDuplicateCommunicationIds");
+
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const kpsJson = scriptProperties.getProperty("active_kps");
+  if (!kpsJson) {
+    Logger.log("⚠ Нет активных КП в Script Properties.");
+    return;
+  }
+
+  const kps = JSON.parse(kpsJson);
+  const now = new Date();
+  const timeZone = Session.getScriptTimeZone();
+  const currentMonth = Utilities.formatDate(now, timeZone, "MMMM_yyyy");
+  const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const previousMonth = Utilities.formatDate(prevDate, timeZone, "MMMM_yyyy");
+
+  const headerMap = getHeaderMap();
+  const valueMap = getValueMap();
+
+  let updatedCount = 0;
+
+  kps.forEach(kp => {
+    try {
+      Logger.log(`📂 КП: ${kp.name}`);
+      const file = SpreadsheetApp.openById(kp.id_work);
+      const sheets = file.getSheets();
+
+      sheets.forEach(sheet => {
+        const sheetName = sheet.getName();
+        const validPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/;
+
+        if (!validPattern.test(sheetName) || ![currentMonth, previousMonth].includes(sheetName)) return;
+
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        Logger.log("📝 Заголовки листа: " + JSON.stringify(headers));
+
+        const headerIndices = getHeaderIndices(headers, headerMap);
+        const { idCol, correctnessCol } = headerIndices;
+
+        Logger.log(`🔍 Индексы колонок - ID: ${idCol}, Correctness: ${correctnessCol}`);
+
+        if (idCol < 1 || correctnessCol < 1) {
+          Logger.log(`⚠️ Лист '${sheetName}' пропущен из-за отсутствия обязательных колонок`);
+          return;
+        }
+
+        const lastRow = sheet.getLastRow();
+        if (lastRow < 2) return;
+
+        const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+        const idMap = new Map();
+        const updates = [];
+
+        data.forEach((row, i) => {
+          const commId = row[idCol - 1];
+          const statusRaw = row[correctnessCol - 1];
+          const status = toRusValue(statusRaw?.toString().trim(), valueMap);
+
+          if (!commId) return;
+
+          if (!idMap.has(commId)) {
+            idMap.set(commId, { count: 1, rows: [{ index: i, status }] });
+          } else {
+            const entry = idMap.get(commId);
+            entry.count++;
+            entry.rows.push({ index: i, status });
+          }
+        });
+
+        idMap.forEach((entry, commId) => {
+          if (entry.count < 2) return;
+
+          const hasTransferred = entry.rows.some(r => r.status === "Перенесено в БД");
+          const nonTransferred = entry.rows.filter(r => r.status !== "Перенесено в БД");
+          const transferred = entry.rows.filter(r => r.status === "Перенесено в БД");
+
+          if (hasTransferred && nonTransferred.length > 0) {
+            nonTransferred.forEach(row => {
+              let newId;
+              do {
+                newId = generateUniqueHash();
+              } while (idMap.has(newId));
+
+              updates.push({ row: row.index + 2, newId });
+              idMap.set(newId, { count: 1, rows: [{ index: row.index, status: row.status }] });
+              updatedCount++;
+              Logger.log(`🔄 Обновлён дубликат в строке ${row.index + 2}: ${newId}`);
+            });
+          } else if (nonTransferred.length > 1) {
+            const row = nonTransferred[0];
+            let newId;
+            do {
+              newId = generateUniqueHash();
+            } while (idMap.has(newId));
+
+            updates.push({ row: row.index + 2, newId });
+            idMap.set(newId, { count: 1, rows: [{ index: row.index, status: row.status }] });
+            updatedCount++;
+            Logger.log(`🔄 Обновлён дубликат в строке ${row.index + 2}: ${newId}`);
+          } else if (transferred.length > 1) {
+            Logger.log(`⚠ Найдены 2+ 'Перенесено в БД' с ID ${commId} на строках: ${transferred.map(r => r.index + 2).join(", ")}`);
+          }
+        });
+
+        updates.forEach(update => {
+          sheet.getRange(update.row, idCol).setValue(update.newId);
+        });
+
+        if (updates.length > 0) {
+          Logger.log(`✅ В листе '${sheetName}' обновлено ${updates.length} ID`);
+        } else {
+          Logger.log(`ℹ Лист '${sheetName}': дубликаты не найдены`);
+        }
+      });
+
+    } catch (error) {
+      Logger.log(`❌ Ошибка в КП '${kp.name}': ${error}`);
+    }
+  });
+
+  Logger.log(`🎯 [END] Готово. Всего обновлено communication_id: ${updatedCount}`);
+}
+
+// Функция для получения индексов колонок
+function getHeaderIndices(headers, headerMap) {
+  const findIndex = (name) => {
+    const engIndex = headers.indexOf(name);
+    const rusHeader = toRusHeader(name, headerMap);
+    const rusIndex = headers.indexOf(rusHeader);
+    return engIndex >= 0 ? engIndex + 1 : (rusIndex >= 0 ? rusIndex + 1 : -1);
+  };
+
+  return {
+    idCol: findIndex("communication_id"),
+    correctnessCol: findIndex("Row Status")
+  };
+}
+
+// Функция генерации уникального communication_id
+function generateUniqueHash() {
+  var hashBase = new Date().getTime() + "_" + Math.random();
+  var hash = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_1, hashBase))
+    .replace(/[^a-zA-Z0-9]/g, '');
+  return hash;
+}
+
+// Загрузка header_map_eng_to_rus
+function getHeaderMap() {
+  const json = PropertiesService.getScriptProperties().getProperty('header_map_eng_to_rus');
+  return json ? JSON.parse(json) : {};
+}
+
+// Загрузка value_map_eng_to_rus
+function getValueMap() {
+  const json = PropertiesService.getScriptProperties().getProperty('value_map_eng_to_rus');
+  return json ? JSON.parse(json) : {};
+}
+
+// Преобразование заголовков (ENG и RUS)
+function toRusHeader(header, map) {
+  const rusVersion = map[header];
+  const engVersion = Object.keys(map).find(key => map[key] === header);
+  return rusVersion || engVersion || header;
+}
+
+// Преобразование значений (ENG и RUS)
+function toRusValue(value, map) {
+  const rusValue = map[value];
+  const engValue = Object.keys(map).find(key => map[key] === value);
+  return rusValue || engValue || value;
+}
