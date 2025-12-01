@@ -1,0 +1,255 @@
+const SLACK_WEBHOOK_URL = "nnnn";
+
+// ЕДИНЫЙ ПОЛУЧАТЕЛЬ УВЕДОМЛЕНИЙ (для всех КП)
+const GLOBAL_RECIPIENT_SLACK_ID = "U0765NHTV4M"; // Оставлен как константа, но не используется в сообщении
+
+// Дополнительные получатели уведомлений для конкретных КП
+const CIS_RECIPIENT_SLACK_ID = "U06RJEU1USW";
+const AZTR_RECIPIENT_SLACK_ID = "U09DX6ZRPC6";
+
+// Ожидаемые названия столбцов в рабочих файлах КП
+const COLUMN_NAMES = {
+  DATE: "Дата",
+  ROW_CORRECTNESS: "Корректность строки",
+  DISTRIBUTION_STATUS: "Статус рассылки",
+  PROCESS_LABEL: "process_lable"
+};
+
+
+/**
+ * Главная функция для проверки всех КП на ошибки переноса данных.
+ * Использует список активных КП из ScriptProperties ("active_kps").
+ */
+function checkKPErrors() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const activeKPs = JSON.parse(scriptProperties.getProperty("active_kps") || "[]");
+  
+  const dateRange = getYesterdayDateRange();
+  const allErrorsByKP = {};
+
+  // Определение имени листа текущего месяца 
+  const today = new Date();
+  const currentSheetName = Utilities.formatDate(today, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "MMMM_yyyy");
+  
+  Logger.log(`✅ Начинаем проверку ошибок переноса за: ${dateRange.start.toLocaleString()}. Целевой лист: ${currentSheetName}`);
+
+  for (const kp of activeKPs) {
+    const kpName = kp.name;        
+    const spreadsheetId = kp.id_work; 
+
+    Logger.log(`➡️ Обработка КП: ${kpName}`);
+    
+    if (!spreadsheetId) {
+       Logger.log(`❌ Пропускаем КП "${kpName}": отсутствует id_work в ScriptProperties.`);
+       continue;
+    }
+
+    try {
+      findErrorsInKP(spreadsheetId, kpName, dateRange, allErrorsByKP, currentSheetName);
+    } catch (e) {
+      Logger.log(`❌ Ошибка доступа/обработки таблицы ${kpName} (ID: ${spreadsheetId}): ${e.toString()}`);
+    }
+  }
+  
+  sendSlackAlerts(allErrorsByKP);
+}
+
+// --------------------------------------------------------------------
+
+/**
+ * Ищет ошибки в одном файле КП и добавляет их в общий объект.
+ * @param {string} spreadsheetId ID рабочего файла КП.
+ * @param {string} kpName Имя КП.
+ * @param {object} dateRange Объект с датами start и end для вчерашнего дня.
+ * @param {object} allErrorsByKP Общий объект для накопления ошибок.
+ * @param {string} sheetName Имя листа для обработки.
+ */
+function findErrorsInKP(spreadsheetId, kpName, dateRange, allErrorsByKP, sheetName) {
+  const kpSpreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = kpSpreadsheet.getSheetByName(sheetName); 
+
+  if (!sheet) {
+    Logger.log(`❌ Лист "${sheetName}" не найден в КП "${kpName}".`);
+    return;
+  }
+  
+  // Получаем фактический GID листа для корректной ссылки
+  const sheetGid = sheet.getSheetId(); 
+
+  const data = sheet.getDataRange().getValues();
+  
+  if (data.length < 2) return;
+  
+  const headers = data[0];
+  const colIndexes = getColumnIndexes(headers, COLUMN_NAMES); 
+  
+  const missingCols = Object.keys(COLUMN_NAMES).filter(key => colIndexes[key] === undefined);
+  if (missingCols.length > 0) {
+    const missingNames = missingCols.map(c => COLUMN_NAMES[c]);
+    Logger.log(`❌ В КП ${kpName} (лист: ${sheetName}) отсутствуют необходимые столбцы: ${missingNames.join(', ')}`);
+    return;
+  }
+  
+  const sheetUrl = kpSpreadsheet.getUrl();
+  
+  if (!allErrorsByKP[kpName]) {
+    allErrorsByKP[kpName] = [];
+  }
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    
+    const dateValue = row[colIndexes.DATE];
+    const correctness = row[colIndexes.ROW_CORRECTNESS] ? row[colIndexes.ROW_CORRECTNESS].toString().trim() : '';
+    const status = row[colIndexes.DISTRIBUTION_STATUS] ? row[colIndexes.DISTRIBUTION_STATUS].toString().trim() : '';
+    const processLabel = row[colIndexes.PROCESS_LABEL] ? row[colIndexes.PROCESS_LABEL].toString().trim() : '';
+    
+    // 1. Фильтр по дате: должна быть вчера
+    const rowDate = dateValue instanceof Date ? dateValue : null;
+    if (!rowDate || rowDate < dateRange.start || rowDate > dateRange.end) {
+      continue;
+    }
+    
+    // 2. Фильтр по "Статус рассылки"
+    if (status !== "Выполнена") {
+      continue;
+    }
+    
+    // 3. Фильтр по "Корректность строки": не пусто И не "Перенесено в БД"
+    if (correctness === "" || correctness === "Перенесено в БД") {
+      continue;
+    }
+    
+    // Строка соответствует всем условиям ошибки
+    
+    const rowNumber = i + 1;
+    // Используем динамический sheetGid для корректной ссылки
+    const link = `${sheetUrl}#gid=${sheetGid}&range=A${rowNumber}`; 
+    
+    allErrorsByKP[kpName].push({
+      link: link,
+      rowNumber: rowNumber,
+      error: correctness,
+      processLabel: processLabel
+    });
+  }
+}
+
+/**
+ * Определяет индексы столбцов по их названиям в первой строке.
+ * @param {Array<string>} headers Массив заголовков столбцов.
+ * @param {object} requiredColumns Объект COLUMN_NAMES, содержащий искомые названия.
+ * @returns {object} Объект, где ключ — это ключ из COLUMN_NAMES, а значение — индекс столбца (0-based).
+ */
+function getColumnIndexes(headers, requiredColumns) {
+  const indexes = {};
+  const headerMap = {};
+  
+  headers.forEach((header, index) => {
+    headerMap[header.toString().trim().toLowerCase()] = index;
+  });
+  
+  for (const key in requiredColumns) {
+    const requiredName = requiredColumns[key].trim().toLowerCase();
+    indexes[key] = headerMap[requiredName];
+  }
+  
+  return indexes;
+}
+
+
+/**
+ * Формирует и отправляет одно общее сообщение об ошибках в Slack.
+ * @param {object} allErrorsByKP Сгруппированные ошибки по КП.
+ */
+function sendSlackAlerts(allErrorsByKP) {
+  const allKPNames = Object.keys(allErrorsByKP).filter(kp => allErrorsByKP[kp].length > 0);
+  
+  if (allKPNames.length === 0) {
+    Logger.log("✅ Ошибки переноса данных за вчерашний день не найдены.");
+    return;
+  }
+  
+  Logger.log(`📣 Найдено ошибок в ${allKPNames.length} КП. Сообщение будет отправлено в Slack.`);
+
+  let messageText = ""; 
+  let mentions = ""; // Переменная для хранения упоминаний
+  
+  // Проверяем, есть ли ошибки в КП "CIS" или "AZTR", и добавляем соответствующие упоминания
+  // Имена КП должны быть строго "CIS" и "AZTR" (регистрозависимо)
+  if (allErrorsByKP["CIS"] && allErrorsByKP["CIS"].length > 0) {
+    mentions += `<@${CIS_RECIPIENT_SLACK_ID}> `;
+  }
+  if (allErrorsByKP["AZTR"] && allErrorsByKP["AZTR"].length > 0) {
+    mentions += `<@${AZTR_RECIPIENT_SLACK_ID}> `;
+  }
+  
+  // Добавляем упоминания в начало сообщения
+  if (mentions.length > 0) {
+    messageText += mentions.trim() + "\n\n";
+  }
+  
+  messageText += "🚨 *Ошибка при переносе данных* в связи с ошибкой в поле `Корректность строки`.\n\n";
+  
+  for (const kpName of allKPNames) {
+    const errors = allErrorsByKP[kpName];
+    if (errors.length === 0) continue;
+    
+    messageText += `*${kpName}:*\n`;
+    
+    errors.forEach((err, index) => {
+      // ❗ ИЗМЕНЕНИЕ: Формат вывода ошибки ❗
+      let errorLine = `${index + 1}. <${err.link}|Строка ${err.rowNumber}>, Ошибка: \`${err.error}\``;
+      
+      // Убираем вывод Process Label, если он N/A или пустой
+      if (err.processLabel && err.processLabel.toUpperCase() !== 'N/A') {
+          errorLine += `, Process Label: \`${err.processLabel}\``;
+      }
+      
+      messageText += errorLine + '\n';
+    });
+    messageText += "\n"; 
+  }
+
+  sendSlackMessage({ text: messageText });
+}
+
+
+/**
+ * АКТИВИРОВАНО: Отправляет сообщение в Slack через Webhook.
+ * @param {object} payload Объект Slack payload с полем text.
+ */
+function sendSlackMessage(payload) {
+  try {
+    const options = {
+      'method' : 'post',
+      'contentType': 'application/json',
+      'payload' : JSON.stringify(payload)
+    };
+    
+    UrlFetchApp.fetch(SLACK_WEBHOOK_URL, options);
+    Logger.log("✅ Успешная отправка сообщения в Slack.");
+    
+  } catch (e) {
+    Logger.log(`❌ Ошибка при отправке сообщения в Slack: ${e.toString()}`);
+  }
+}
+
+/**
+ * Рассчитывает временной диапазон для вчерашнего дня (с 00:00:00 до 23:59:59).
+ * @returns {object} Объект с датами start и end.
+ */
+function getYesterdayDateRange() {
+  const today = new Date();
+  const timeZone = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  
+  const formattedYesterday = Utilities.formatDate(yesterday, timeZone, "yyyy-MM-dd");
+  
+  const start = new Date(formattedYesterday + "T00:00:00");
+  const end = new Date(formattedYesterday + "T23:59:59");
+  
+  return { start, end };
+}
