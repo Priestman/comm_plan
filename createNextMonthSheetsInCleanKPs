@@ -1,0 +1,41 @@
+function createNextMonthSheetsInCleanKPs() {
+  const timeZone = Session.getScriptTimeZone();
+  const today = new Date();
+  const currentMonthName = Utilities.formatDate(today, timeZone, "MMMM_yyyy");
+
+  const nextMonthDate = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+  const nextMonthName = Utilities.formatDate(nextMonthDate, timeZone, "MMMM_yyyy");
+
+  const cleanKPs = JSON.parse(PropertiesService.getScriptProperties().getProperty("active_kps") || "[]")
+    .filter(kp => kp.id_clean);
+
+  cleanKPs.forEach(kp => {
+    try {
+      const spreadsheet = SpreadsheetApp.openById(kp.id_clean);
+
+      const currentSheet = spreadsheet.getSheetByName(currentMonthName);
+      const nextSheet = spreadsheet.getSheetByName(nextMonthName);
+
+      if (!currentSheet) {
+        Logger.log(`⚠️ Лист ${currentMonthName} не найден в ${kp.name}`);
+        return;
+      }
+
+      if (nextSheet) {
+        Logger.log(`ℹ️ Лист ${nextMonthName} уже существует в ${kp.name}`);
+        return;
+      }
+
+      const newSheet = spreadsheet.insertSheet(nextMonthName, {template: currentSheet});
+      const lastColumn = currentSheet.getLastColumn();
+      const headers = currentSheet.getRange(1, 1, 1, lastColumn).getValues();
+
+      newSheet.clear(); // очищаем шаблонный лист
+      newSheet.getRange(1, 1, 1, lastColumn).setValues(headers);
+
+      Logger.log(`✅ Лист ${nextMonthName} создан в ${kp.name}`);
+    } catch (err) {
+      Logger.log(`❌ Ошибка в ${kp.name}: ${err}`);
+    }
+  });
+}
