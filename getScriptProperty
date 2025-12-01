@@ -1,0 +1,243 @@
+/**
+ * Вспомогательная функция для безопасного получения свойств скрипта.
+ * Выдаст ошибку, если свойство не установлено, помогая диагностировать проблемы.
+ * @param {string} key Ключ свойства, которое нужно получить.
+ * @returns {string} Значение свойства.
+ * @throws {Error} Если свойство не найдено.
+ */
+function getScriptProperty(key) {
+  const properties = PropertiesService.getScriptProperties();
+  const value = properties.getProperty(key);
+  if (!value) {
+    throw new Error(`Ошибка: Свойство '${key}' не найдено. Пожалуйста, установите его в 'Настройках проекта' -> 'Свойства скрипта'.`);
+  }
+  return value;
+}
+
+/**
+ * Автоматически заполняет колонку "ГЕО переводы" на основе заданных условий.
+ * Запускается по временному триггеру (рекомендуется каждые 2 минуты).
+ */
+function autoFillGeoTranslations() {
+  Logger.log(`🔗 Запуск функции autoFillGeoTranslations.`);
+
+  // Получаем значения из PropertiesService
+  const TARGET_SPREADSHEET_ID = getScriptProperty('TARGET_SPREADSHEET_ID');
+  const GEO_LANG_MAP_FILE_ID = getScriptProperty('GEO_LANG_MAP_FILE_ID');
+  const GEO_LANG_MAP_SHEET_NAME_IN_FILE = getScriptProperty('GEO_LANG_MAP_SHEET_NAME_IN_FILE');
+
+  // Определяем константы, которые не являются "чувствительными данными"
+  const CHANNELS_ALLOWING_MANUAL_INPUT = new Set(["SMS", "Whatsapp"]);
+  const GEO_LIST_DELIMITER = ",";
+
+  let spreadsheet;
+  try {
+    spreadsheet = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+    Logger.log(`✅ Открыт целевой файл: '${spreadsheet.getName()}' (ID: ${TARGET_SPREADSHEET_ID})`);
+  } catch (e) {
+    Logger.log(`❌ Ошибка: Не удалось открыть целевой файл с ID '${TARGET_SPREADSHEET_ID}'. Убедитесь, что ID корректен и у скрипта есть права доступа. ${e.message}`);
+    return; // Прерываем выполнение, если файл не открылся
+  }
+
+  const now = new Date();
+  const scriptTimeZone = Session.getScriptTimeZone();
+
+  // Определяем имена листов текущего и следующего месяца для обработки
+  const currentMonthName = Utilities.formatDate(now, scriptTimeZone, "MMMM_yyyy");
+  
+  // 💡 НАДЕЖНОЕ ИСПРАВЛЕНИЕ:
+  // 1. Создаем дату, которая является первым числом *текущего* месяца.
+  //    Это позволяет избежать сдвига из-за 31-го числа при переходе к следующему месяцу.
+  const dateForNextMonth = new Date(now.getFullYear(), now.getMonth(), 1); 
+  // 2. Увеличиваем месяц на 1.
+  dateForNextMonth.setMonth(dateForNextMonth.getMonth() + 1);
+  
+  // 3. Форматируем результат в нужной временной зоне.
+  const nextMonthName = Utilities.formatDate(dateForNextMonth, scriptTimeZone, "MMMM_yyyy");
+
+  Logger.log(`👉 Будут обработаны листы: '${currentMonthName}' и '${nextMonthName}'.`);
+
+  try {
+    // Загружаем карту соответствий ГЕО-Языков один раз
+    const geoDataFromMapping = getGeoLanguageMap(GEO_LANG_MAP_FILE_ID, GEO_LANG_MAP_SHEET_NAME_IN_FILE);
+    const geoLanguageMap = geoDataFromMapping.geoLanguageMap;
+
+    const currentMonthSheet = spreadsheet.getSheetByName(currentMonthName);
+    if (currentMonthSheet) {
+      processSheetForConditionalGeoTranslations(currentMonthSheet, geoLanguageMap, CHANNELS_ALLOWING_MANUAL_INPUT, GEO_LIST_DELIMITER);
+    } else {
+      Logger.log(`ℹ️ Лист '${currentMonthName}' не найден в файле '${spreadsheet.getName()}'. Пропуск обработки.`);
+    }
+
+    const nextMonthSheet = spreadsheet.getSheetByName(nextMonthName);
+    if (nextMonthSheet) {
+      processSheetForConditionalGeoTranslations(nextMonthSheet, geoLanguageMap, CHANNELS_ALLOWING_MANUAL_INPUT, GEO_LIST_DELIMITER);
+    } else {
+      Logger.log(`ℹ️ Лист '${nextMonthName}' не найден в файле '${spreadsheet.getName()}'. Пропуск обработки.`);
+    }
+
+    Logger.log("✅ Автоматическое заполнение 'ГЕО переводы' завершено.");
+
+  } catch (e) {
+    Logger.log(`❌ Произошла общая ошибка при выполнении autoFillGeoTranslations: ${e.message}`);
+  }
+}
+
+/**
+ * Вспомогательная функция для обработки строк на одном листе на основе заданных условий.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet Обрабатываемый лист.
+ * @param {Map<string, string[]>} geoLanguageMap Карта соответствий ГЕО и языков.
+ * @param {Set<string>} channelsAllowingManualInput Набор каналов, разрешающих ручной ввод.
+ * @param {string} geoListDelimiter Разделитель для списка ГЕО.
+ */
+function processSheetForConditionalGeoTranslations(sheet, geoLanguageMap, channelsAllowingManualInput, geoListDelimiter) {
+  // Защитная проверка на случай, если объект листа по какой-то причине не был передан.
+  if (!sheet) {
+    Logger.log(`❌ ОШИБКА: В функцию processSheetForConditionalGeoTranslations передан пустой объект листа. Невозможно продолжить.`);
+    return;
+  }
+
+  Logger.log(`⚙️ Обработка листа: '${sheet.getName()}' для условного заполнения "ГЕО переводы"...`);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) { // Если на листе только заголовки или он пуст
+    Logger.log(`ℹ️ Лист '${sheet.getName()}' пуст или содержит только заголовки. Пропуск.`);
+    return;
+  }
+
+  // Получаем заголовки для определения индексов колонок
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  // Определяем индексы нужных колонок по их заголовкам
+  const statusColIndex = headers.indexOf("Статус рассылки");
+  const geoColIndex = headers.indexOf("ГЕО");
+  const channelColIndex = headers.indexOf("Канал");
+  const translationsColIndex = headers.indexOf("ГЕО переводы");
+
+  // Проверяем наличие всех необходимых колонок
+  if (statusColIndex === -1) { Logger.log(`❌ Ошибка в листе '${sheet.getName()}': Колонка 'Статус рассылки' не найдена.`); return; }
+  if (geoColIndex === -1) { Logger.log(`❌ Ошибка в листе '${sheet.getName()}': Колонка 'ГЕО' не найдена.`); return; }
+  if (channelColIndex === -1) { Logger.log(`❌ Ошибка в листе '${sheet.getName()}': Колонка 'Канал' не найдена.`); return; }
+  if (translationsColIndex === -1) { Logger.log(`❌ Ошибка в листе '${sheet.getName()}': Колонка 'ГЕО переводы' не найдена.`); return; }
+
+  // Получаем все данные с листа (начиная со второй строки) одним запросом для повышения производительности
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, headers.length);
+  const values = dataRange.getValues();
+
+  const translationsToUpdate = [];
+  let updatesCount = 0;
+
+  values.forEach((row, rowIndexInValues) => {
+    const rowNumber = rowIndexInValues + 2; // Реальный номер строки в таблице (начинается со 2)
+    const status = row[statusColIndex]?.toString().trim(); // Значение из "Статус рассылки"
+    const channel = row[channelColIndex]?.toString().trim(); // Значение из "Канал"
+    const geoCellContent = row[geoColIndex]; // Значение из "ГЕО"
+    const currentTranslations = row[translationsColIndex]?.toString().trim(); // Текущее значение из "ГЕО переводы"
+
+    // Проверка условий фильтрации
+    const isStatusEligible = (status === "В ожидании" || status === "Согласована"); // Статус = "В ожидании" или "Согласована"
+    const isChannelEligible = !channelsAllowingManualInput.has(channel); // Канал != "SMS", "Whatsapp"
+    const isTranslationsEmpty = !currentTranslations; // Колонка "ГЕО переводы" пуста
+
+    // Если все условия выполнены, рассчитываем и добавляем значение для обновления
+    if (isStatusEligible && isChannelEligible && isTranslationsEmpty) {
+      let resultingLanguages = new Set(); // Используем Set для хранения только уникальных языков
+
+      if (geoCellContent) {
+        // Разделяем содержимое колонки "ГЕО" по запятой и очищаем от пробелов
+        const individualGeos = geoCellContent.toString().split(geoListDelimiter)
+          .map(g => g.trim())
+          .filter(g => g !== ''); // Отфильтровываем пустые строки после trim
+
+        individualGeos.forEach(geo => {
+          const languagesForGeo = geoLanguageMap.get(geo); // Получаем языки для текущего ГЕО из карты маппинга
+          if (languagesForGeo) {
+            languagesForGeo.forEach(lang => resultingLanguages.add(lang)); // Добавляем языки в Set
+          } else {
+            Logger.log(`⚠️ Предупреждение в листе '${sheet.getName()}', строка ${rowNumber}: Для ГЕО '${geo}' не найдено соответствий языков в справочнике маппинга.`);
+          }
+        });
+      }
+      // Преобразуем Set уникальных языков в массив, сортируем и объединяем в строку через запятую
+      const finalLanguageString = Array.from(resultingLanguages).sort().join(', ');
+      translationsToUpdate.push([finalLanguageString]); // Добавляем рассчитанное значение
+      updatesCount++; // Увеличиваем счетчик обновлений
+      Logger.log(`✅ Строка ${rowNumber} на листе '${sheet.getName()}' обновлена: "ГЕО переводы" установлено на '${finalLanguageString}'`);
+    } else {
+      // Если строка не соответствует всем условиям, оставляем текущее значение,
+      // чтобы сохранить правильное соответствие строк при массовом setValues.
+      translationsToUpdate.push([currentTranslations]);
+    }
+  });
+
+  // Массовое обновление колонки "ГЕО переводы" для повышения производительности
+  if (updatesCount > 0) {
+    sheet.getRange(2, translationsColIndex + 1, translationsToUpdate.length, 1).setValues(translationsToUpdate);
+    Logger.log(`✅ Заполнение "ГЕО переводы" для листа '${sheet.getName()}' завершено. Обновлено строк: ${updatesCount}.`);
+  } else {
+    Logger.log(`ℹ️ На листе '${sheet.getName()}' не найдено строк, соответствующих условиям для обновления.`);
+  }
+}
+
+/**
+ * Читает таблицу соответствий ГЕО и языков с указанного листа в другом файле.
+ * @param {string} mapFileId ID файла Google Таблицы, содержащего карту маппинга.
+ * @param {string} mapSheetName Имя листа в файле маппинга.
+ * @returns {{geoLanguageMap: Map<string, string[]>, allUniqueGeos: string[], allUniqueLanguages: string[]}} Объект, содержащий карту маппинга ГЕО-Языков, а также списки всех уникальных ГЕО и языков.
+ * @throws {Error} Если файл или лист маппинга не найдены, или они пусты.
+ */
+function getGeoLanguageMap(mapFileId, mapSheetName) {
+  let mapSpreadsheet;
+  try {
+    mapSpreadsheet = SpreadsheetApp.openById(mapFileId);
+  } catch (e) {
+    throw new Error(`Не удалось открыть файл маппинга с ID '${mapFileId}'. Убедитесь, что ID корректен и у скрипта есть права доступа. Ошибка: ${e.message}`);
+  }
+
+  const mapSheet = mapSpreadsheet.getSheetByName(mapSheetName);
+  if (!mapSheet) {
+    throw new Error(`Лист соответствий ГЕО и языков ('${mapSheetName}') не найден в файле '${mapSpreadsheet.getName()}'. Проверьте имя листа.`);
+  }
+
+  const lastRow = mapSheet.getLastRow();
+  if (lastRow <= 1) {
+    throw new Error(`Лист соответствий ГЕО и языков ('${mapSheetName}') пуст или содержит только заголовки.`);
+  }
+
+  // Читаем данные из первых двух колонок (ГЕО и Языки) со 2-й строки
+  const mapData = mapSheet.getRange(2, 1, lastRow - 1, 2).getValues();
+
+  const geoLangMap = new Map();
+  const uniqueGeos = new Set();
+  const uniqueLanguages = new Set();
+
+  mapData.forEach(row => {
+    const geo = row[0]?.toString().trim();
+    const languagesString = row[1]?.toString().trim();
+
+    if (geo) {
+      uniqueGeos.add(geo);
+    }
+
+    if (languagesString) {
+      const languages = languagesString.split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+      languages.forEach(lang => uniqueLanguages.add(lang));
+    }
+
+    if (geo && languagesString) {
+      const languages = languagesString.split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+      if (languages.length > 0) {
+        geoLangMap.set(geo, languages);
+      }
+    }
+  });
+
+  Logger.log(`✅ Загружена карта соответствий ГЕО-Языки. Записей: ${geoLangMap.size}`);
+  Logger.log(`✅ Обнаружено уникальных ГЕО: ${uniqueGeos.size}, уникальных языков: ${uniqueLanguages.size}`);
+
+  return {
+    geoLanguageMap: geoLangMap,
+    allUniqueGeos: Array.from(uniqueGeos).sort(),
+    allUniqueLanguages: Array.from(uniqueLanguages).sort()
+  };
+}
