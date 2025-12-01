@@ -1,0 +1,24 @@
+function cacheMirrorData() {
+  const sheet = SpreadsheetApp.openById("1AC-PTqXJjiwO1igm_EKSjZ55zE3r92TNq4YCDl6_QFQ")
+    .getSheetByName("Main");
+
+  if (!sheet) {
+    Logger.log("⚠ Источник зеркал не найден.");
+    return;
+  }
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const mirrorRow = sheet.getRange(3, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  const cache = {};
+  for (let i = 1; i < headers.length; i++) { // начинаем с 1, пропуская A
+    const geo = headers[i]?.trim();
+    const mirror = mirrorRow[i]?.trim();
+    if (geo && mirror) {
+      cache[geo] = mirror;
+    }
+  }
+
+  PropertiesService.getScriptProperties().setProperty("geo_mirror_cache", JSON.stringify(cache));
+  Logger.log("✅ Кэш зеркал обновлён. Всего ГЕО: " + Object.keys(cache).length);
+}
