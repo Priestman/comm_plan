@@ -1,0 +1,145 @@
+function fillMissingCommunicationIds() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const kpsJson = scriptProperties.getProperty("active_kps");
+  if (!kpsJson) return Logger.log("⚠ Нет активных КП в Script Properties.");
+
+  const kps = JSON.parse(kpsJson);
+  let processedCount = 0;
+
+  const now = new Date();
+  const timeZone = Session.getScriptTimeZone();
+  const currentMonth = Utilities.formatDate(now, timeZone, "MMMM_yyyy");
+  const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const previousMonth = Utilities.formatDate(prevDate, timeZone, "MMMM_yyyy");
+
+  const headerMap = getHeaderMap();
+  const valueMap = getValueMap();
+
+  Logger.log("📦 Загружен headerMap: " + JSON.stringify(headerMap));
+  Logger.log("📦 Загружен valueMap: " + JSON.stringify(valueMap));
+
+  kps.forEach(kp => {
+    try {
+      Logger.log("📌 Обработка КП: " + kp.name);
+
+      const workFile = SpreadsheetApp.openById(kp.id_work);
+      const sheets = workFile.getSheets();
+
+      sheets.forEach(sheet => {
+        const sheetName = sheet.getName();
+        const monthYearPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/;
+
+        if (!monthYearPattern.test(sheetName) || ![currentMonth, previousMonth].includes(sheetName)) {
+          Logger.log("🛑 Лист пропущен: " + sheetName);
+          return;
+        }
+
+        Logger.log("✅ Обработка листа: " + sheetName);
+
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        Logger.log("📝 Заголовки листа: " + JSON.stringify(headers));
+
+        const headerToIndex = (name) => {
+          const engIndex = headers.indexOf(name);
+          const rusHeader = toRusHeader(name, headerMap);
+          const rusIndex = headers.indexOf(rusHeader);
+
+          Logger.log(`🔍 Поиск колонки "${name}" - ENG: ${engIndex + 1}, RUS: ${rusIndex + 1}`);
+          return engIndex >= 0 ? engIndex + 1 : (rusIndex >= 0 ? rusIndex + 1 : -1);
+        };
+
+        const idCol = headerToIndex("communication_id");
+        const dateCol = headerToIndex("Date");
+        const trackCol = headerToIndex("Track");
+        const statusCol = headerToIndex("Campaign Status");
+        const correctnessCol = headerToIndex("Row Status");
+
+        if ([idCol, dateCol, trackCol, statusCol, correctnessCol].some(c => c < 1)) {
+          Logger.log("⚠️ Пропущен лист " + sheetName + " из-за отсутствия обязательных колонок");
+          return;
+        }
+
+        const lastRow = sheet.getLastRow();
+        if (lastRow < 2) {
+          Logger.log("⚠️ Лист " + sheetName + " пустой, пропуск...");
+          return;
+        }
+
+        const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+        const correctnessRange = sheet.getRange(2, correctnessCol, lastRow - 1, 1);
+        const correctnessValues = correctnessRange.getValues();
+
+        let updated = false;
+
+        for (let i = 0; i < data.length; i++) {
+          const id = data[i][idCol - 1];
+          const date = data[i][dateCol - 1];
+          const track = data[i][trackCol - 1];
+          const statusRaw = data[i][statusCol - 1]?.toString().trim();
+          const status = toRusValue(statusRaw, valueMap);
+
+          if (status !== "Выполнена" || id) continue;
+
+          if (Object.prototype.toString.call(date) === "[object Date]" && track?.toString().trim()) {
+            const newId = generateUniqueHashMis();
+            data[i][idCol - 1] = newId;
+            processedCount++;
+
+            try {
+              sheet.getRange(i + 2, idCol).setValue(newId);
+              Logger.log("🆕 Новый communication_id добавлен: " + newId + " в строке " + (i + 2));
+            } catch (error) {
+              correctnessValues[i][0] = "Ошибка валидации communication_id";
+              Logger.log("❌ Ошибка при записи communication_id: " + error);
+            }
+
+            updated = true;
+          }
+        }
+
+        if (updated) {
+          correctnessRange.setValues(correctnessValues);
+          Logger.log("✅ Обновления завершены для листа: " + sheetName);
+        }
+      });
+    } catch (err) {
+      Logger.log("❌ Ошибка в КП " + kp.name + ": " + err);
+    }
+  });
+
+  Logger.log("🎯 communication_id добавлены: " + processedCount);
+}
+
+// Функция генерации уникального communication_id
+function generateUniqueHashMis() {
+  var hashBase = new Date().getTime() + "_" + Math.random();
+  var hash = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_1, hashBase))
+    .replace(/[^a-zA-Z0-9]/g, '');
+  return hash;
+}
+
+// Загрузка header_map_eng_to_rus
+function getHeaderMap() {
+  const json = PropertiesService.getScriptProperties().getProperty('header_map_eng_to_rus');
+  return json ? JSON.parse(json) : {};
+}
+
+// Загрузка value_map_eng_to_rus
+function getValueMap() {
+  const json = PropertiesService.getScriptProperties().getProperty('value_map_eng_to_rus');
+  return json ? JSON.parse(json) : {};
+}
+
+// Преобразование заголовков (ENG и RUS)
+function toRusHeader(header, map) {
+  const rusVersion = map[header];
+  const engVersion = Object.keys(map).find(key => map[key] === header);
+  return rusVersion || engVersion || header;
+}
+
+// Преобразование значений (ENG и RUS)
+function toRusValue(value, map) {
+  const rusValue = map[value];
+  const engValue = Object.keys(map).find(key => map[key] === value);
+  return rusValue || engValue || value;
+}
