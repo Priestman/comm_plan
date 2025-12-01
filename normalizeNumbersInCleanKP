@@ -1,0 +1,100 @@
+function normalizeNumbersInCleanKP() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const kpsJson = scriptProperties.getProperty("active_kps");
+
+  if (!kpsJson) {
+    Logger.log("⚠ Нет активных КП в Script Properties.");
+    return;
+  }
+
+  const kps = JSON.parse(kpsJson);
+  let processedCells = 0;
+
+  // Список целевых заголовков (русские, точное совпадение)
+  const targetHeaders = [
+    "Отправлено", "Доставлено", "Прочитано", "Спенд", "Клики", "Уникальных юзеров с депозитом",
+    "Кол-во депов", "Сумма депов", "Сумма первых депозитов после перехода по треку", "ClickToDep",
+    "кол-во неуд депов", "сумма неуд депов", "Соотношение\nкол-во неуд / уд депы",
+    "Сумма HOLD (разница dep - cashout)", "DeliveryRate", "ClickRate", "CRtoDep", "Доходность (dep)",
+    "ROMI (dep)", "Отправлено по группам", "Доставлено по группам", "Спенд по группам", "Клики по группам",
+    "Уникальных юзеров с депозитом по группам", "Кол-во депов по группам", "Сумма депов по группам",
+    "Сумма первых депозитов после перехода по треку по группам", "ClickToDep по группам",
+    "кол-во неуд депов по группам", "сумма неуд депов по группам", "Соотношение неуд к уд депы по группам",
+    "Сумма HOLD (разница dep - cashout) по группам"
+  ];
+
+  // Получаем текущий и предыдущий месяц
+  const now = new Date();
+  const previous = new Date();
+  previous.setMonth(previous.getMonth() - 1);
+  const timeZone = Session.getScriptTimeZone();
+  const monthsToProcess = [
+    Utilities.formatDate(previous, timeZone, "MMMM_yyyy"),
+    Utilities.formatDate(now, timeZone, "MMMM_yyyy")
+  ];
+
+  kps.forEach(kp => {
+    monthsToProcess.forEach(monthName => {
+      try {
+        const cleanFile = SpreadsheetApp.openById(kp.id_clean);
+        const sheet = cleanFile.getSheetByName(monthName);
+
+        if (!sheet) {
+          Logger.log("❌ Лист " + monthName + " не найден в КП: " + kp.name);
+          return;
+        }
+
+        Logger.log("📌 Обрабатываем КП: " + kp.name + ", лист: " + monthName);
+
+        // Получаем заголовки (первая строка)
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+        // Определяем индексы нужных столбцов
+        const targetIndexes = targetHeaders
+          .map(header => headers.indexOf(header))
+          .filter(idx => idx >= 0);
+
+        if (targetIndexes.length === 0) {
+          Logger.log("⚠ Нет целевых столбцов на листе " + monthName + " (" + kp.name + ")");
+          return;
+        }
+
+        // Читаем диапазон данных (начиная со второй строки)
+        const numRows = sheet.getLastRow() - 1;
+        if (numRows <= 0) return;
+
+        const data = sheet.getRange(2, 1, numRows, sheet.getLastColumn()).getValues();
+        let hasUpdates = false;
+
+        // Проходим по строкам и целевым столбцам
+        for (let i = 0; i < data.length; i++) {
+          for (let idx of targetIndexes) {
+            let cellValue = data[i][idx];
+            if (typeof cellValue === "string") {
+              let newValue = cellValue.replace(",", ".").trim();
+              if (!isNaN(newValue) && newValue !== "") {
+                newValue = parseFloat(newValue);
+                if (data[i][idx] !== newValue) {
+                  data[i][idx] = newValue;
+                  hasUpdates = true;
+                  processedCells++;
+                }
+              }
+            }
+          }
+        }
+
+        // Если были изменения, записываем обратно
+        if (hasUpdates) {
+          sheet.getRange(2, 1, numRows, sheet.getLastColumn()).setValues(data);
+          Logger.log("✅ В КП: " + kp.name + " / " + monthName + " — обновлено ячеек: " + processedCells);
+        }
+
+      } catch (error) {
+        Logger.log("❌ Ошибка обработки КП: " + kp.name + " / " + monthName + " → " + error);
+      }
+    });
+  });
+
+  Logger.log("🎯 Завершено. Всего обработано ячеек: " + processedCells);
+}
