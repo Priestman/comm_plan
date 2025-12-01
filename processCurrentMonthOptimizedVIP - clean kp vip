@@ -1,0 +1,225 @@
+function processCurrentMonthOptimizedVIP() {
+  const fileIds = [
+    '10FIafx7vbDb7ocVT9CRjja9TRzEKEgcxpvt6iIDXWdQ', // Botto*
+    '1OOy5gw-y92iYwFiMoTrj8CYrXhj19-9WkuiJGbmkFjc', // P1
+    '1qp14UXR-9-iHgkxOGj42jccya2yg7jYec3HgIY72Ws4', // QAZAR
+    '1vR34UA3hRlFteT3WyQCu5oW-p5seu2S5ZZvgglgObcI', // Intel-telecom
+    '1_uIO2zoNgSSw5Nvd-TothCconle9Lyjcn9bOVgAlFQs', // TION - формат мессенджеры неверный
+    '19GdxG4ds7wqkyuSFX5OGgQWProqEZFeB0cVd4VlN_5Q', // Sempico *
+    '1Qzj0lSmIWPQXp_lddKXtmOtMOIyCI1l2-9VMA0JEAyM', // Miatel *
+    '17AYR0R268OWMz4xmLpN3N-3FNqPd4Nr5uFpJugkk56A', // OneSim 
+    '1hfDa1qy2x-B2On_r-o8LLZCfmew_5IUphgyc-LDqesg', // tele0
+    '14gOJP0hVUB-_AApbcAS2hZxuh7BWY_-kSWvz4bOTqo0', // Karix
+    '1X8tAyl1-ZSXSSyEZwncLa5En9hba3xyzKrVgW1RU5xM', // Whiz
+    '1e9RFq2F5YDf3S03xHQ8MLTYps_-1C6kjA34aU8C7Ctk', // InfoBip
+    '12uNaeNUeNrKNJl8lQuMqffc9dNZFiNS7GYzXFgMNNU8',  // Intergo
+    '1AHVBiDmELq5zXu6qso0DQcy23TJ2Mi-APDLKvL-xcwQ', // Zazumedia
+    '1y4Bkyh0IvSC0UTU6nhJxTB_DMPx34X1PnlnwsmJ6IAE', // Кантриком
+    '17g7Q72Cd4ecTesIvRFPGwIKHEtAML5ieKiSlwFBQ2ao', // Retail
+    '1lGrZpLjBOTAclruho-NNf_RgEh9r5jwLijyo4zX8mm8', // MortyMedia
+    '1u4B620NoAgzWtBqlFAmcq-Qi9enJ3-sRbNUpVUR0BN0', // DEXATEL
+    '13OuGvtaXj9uLgQwEr62XwGYRhG74F4x0GYuTbVT61nU', // Lexico
+
+  ];
+  const mainSheet = SpreadsheetApp.openById('1yOC7lFlwFfXgthb5irjjoJt9tMY8bS7L4FE9Tn3-ESI');
+  const sheets = mainSheet.getSheets();
+
+  const currentDate = new Date();
+  const currentMonth = currentDate.getMonth();
+  const currentYear = currentDate.getFullYear();
+  const cutoffDate = new Date(currentDate);
+  cutoffDate.setDate(currentDate.getDate() - 50);
+
+  const startMonth = 8, startYear = 2024;
+  const allExternalData = loadExternalData(fileIds);
+
+  for (const sheet of sheets) {
+    const sheetName = sheet.getName();
+    const parsed = parseSheetName(sheetName);
+    if (!parsed) continue;
+
+    const { month, year } = parsed;
+    if (year < startYear || (year === startYear && month < startMonth)) continue;
+    if (year > currentYear || (year === currentYear && month > currentMonth)) continue;
+
+    Logger.log(`📄 Обработка листа: ${sheetName}`);
+    processMonthSheet(sheet, cutoffDate, allExternalData);
+  }
+
+  Logger.log("✅ Завершено обновление метрик process_lable");
+}
+
+function loadExternalData(fileIds) {
+  const cache = [];
+  for (const id of fileIds) {
+    try {
+      const file = SpreadsheetApp.openById(id);
+      const sms = file.getSheetByName('смс');
+      const messengers = file.getSheetByName('Мессенджеры');
+      cache.push({
+        sms: sms ? sms.getDataRange().getValues() : [],
+        messenger: messengers ? messengers.getDataRange().getValues() : []
+      });
+    } catch (e) {
+      Logger.log(`❌ Ошибка загрузки файла ${id}: ${e.message}`);
+    }
+  }
+  return cache;
+}
+
+function processMonthSheet(sheet, cutoffDate, externalData) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const data = sheet.getDataRange().getValues();
+
+  const idx = (name) => headers.indexOf(name);
+  const colDate = 0;
+  const colChannel = idx('Канал');
+  const colGEO = idx('ГЕО');
+  const colProcess = idx('process_lable');
+  const colSent = idx('Отправлено');
+  const colDelivered = idx('Доставлено');
+  const colSpend = idx('Спенд');
+
+  const updates = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowDate = new Date(row[colDate]);
+    const channel = row[colChannel];
+    const geoRaw = row[colGEO];
+    const baseProcess = (row[colProcess] || '').toString().trim();
+
+    // ⬇️ добавили WA/TG/SMS в допустимые каналы
+    if (!baseProcess || !['SMS', 'Telegram', 'Whatsapp', 'WA/TG/SMS'].includes(channel) || row[colSent] || row[colDelivered] || row[colSpend]) continue;
+    if (!geoRaw || geoRaw.toString().trim() === '') continue;
+
+    const geoString = geoRaw.toString().trim().toLowerCase();
+    let geoList = [];
+
+    if (geoString === 'ALL') {
+      geoList = [baseProcess];
+    } else {
+        const geos = geoString
+        .split(',')
+        .map(g => g.trim().toLowerCase()) // 🔧 преобразуем в ВЕРХНИЙ регистр
+        .filter(g => g);
+      geoList = geos.length <= 1
+          ? [baseProcess]
+          : geos.map(g => `${baseProcess}_${g}`);
+    }     
+
+    Logger.log(`🔍 Строка ${i + 1}: канал=${channel} | GEO=${geoString} | process_lable=${baseProcess} | ключи=${geoList.join(', ')}`);
+
+    const result = findDataInExternal(externalData, geoList, channel);
+
+    if (!result || result.b === 0 || result.c === 0 || result.i === 0) {
+      if (rowDate < cutoffDate) {
+        Logger.log(`⚠️ Строка ${i + 1}: не найдены данные → ставим 'Ошибка'`);
+        sheet.getRange(i + 1, colSent + 1).setValue("Ошибка");
+      }
+      continue;
+    }
+
+    // детализированное логирование для WA/TG/SMS
+    if (channel === 'WA/TG/SMS' && result.breakdown) {
+      const s = result.breakdown.sms, m = result.breakdown.msg;
+      Logger.log(`✅ Строка ${i + 1} → SMS={b:${s.b}, c:${s.c}, i:${s.i}}; MSG={b:${m.b}, c:${m.c}, i:${m.i}}; TOTAL={b:${result.b}, c:${result.c}, i:${result.i}}`);
+    } else {
+      Logger.log(`✅ Строка ${i + 1} → отправлено=${result.b}, доставлено=${result.c}, спенд=${result.i}`);
+    }
+
+    updates.push([i + 1, result.b, result.c, result.i]);
+  }
+
+  // Чанковая запись (как было)
+  for (const [row, valB, valC, valI] of updates) {
+    sheet.getRange(row, colSent + 1).setValue(valB);
+    sheet.getRange(row, colDelivered + 1).setValue(valC);
+    sheet.getRange(row, colSpend + 1).setValue(valI);
+  }
+
+  Logger.log(`📊 Обновлено строк: ${updates.length}`);
+}
+
+/**
+ * Ищет данные по ключам.
+ * - Для SMS: в листе 'смс'
+ * - Для Telegram/Whatsapp: в листе 'Мессенджеры'
+ * - Для WA/TG/SMS: в ОБОИХ листах в пределах ПЕРВОГО файла, где найдено что-то валидное; суммирует SMS+MSG.
+ * «Валидность» как раньше: суммируем только строки, где b,c,i все ненулевые.
+ */
+function findDataInExternal(allData, keys, channel) {
+  const normalizedKeys = keys.map(k => k.toString().trim().toLowerCase());
+
+  // помощник суммирования по одному листу
+  function aggregateFromSource(source, mode /* 'SMS' | 'MSG' */) {
+    let b = 0, c = 0, i = 0, valid = false;
+    for (let row = 1; row < source.length; row++) {
+      const rawKey = source[row][0];
+      const key = rawKey ? rawKey.toString().trim().toLowerCase() : '';
+      if (!key) continue;
+      if (normalizedKeys.some(prefix => key.startsWith(prefix))) {
+        if (mode === 'SMS') {
+          let bVal = normalizeNumber(source[row][1] || 0);
+          let cVal = normalizeNumber(source[row][2] || 0);
+          let iVal = normalizeNumber(source[row][8] || 0);
+          if (bVal && cVal && iVal) { b += bVal; c += cVal; i += iVal; valid = true; }
+        } else { // 'MSG' (Мессенджеры)
+          let bVal = normalizeNumber(source[row][3] || 0);
+          let cVal = normalizeNumber(source[row][3] || 0); // как было: Delivered == Sent
+          let iVal = normalizeNumber(source[row][4] || 0);
+          if (bVal && cVal && iVal) { b += bVal; c += cVal; i += iVal; valid = true; }
+        }
+      }
+    }
+    return { b, c, i, valid };
+  }
+
+  for (const { sms, messenger } of allData) {
+    if (channel === 'SMS') {
+      const agg = aggregateFromSource(sms, 'SMS');
+      if (agg.valid) return { b: agg.b, c: agg.c, i: agg.i };
+    } else if (channel === 'Telegram' || channel === 'Whatsapp') {
+      const agg = aggregateFromSource(messenger, 'MSG');
+      if (agg.valid) return { b: agg.b, c: agg.c, i: agg.i };
+    } else if (channel === 'WA/TG/SMS') {
+      const aggSms = aggregateFromSource(sms, 'SMS');
+      const aggMsg = aggregateFromSource(messenger, 'MSG');
+
+      // валидно, если хотя бы один лист дал валидную сумму (правило 3)
+      if (aggSms.valid || aggMsg.valid) {
+        const totalB = aggSms.b + aggMsg.b;
+        const totalC = aggSms.c + aggMsg.c; // для MSG c == b, уже учтено
+        const totalI = aggSms.i + aggMsg.i;
+
+        return {
+          b: totalB,
+          c: totalC,
+          i: totalI,
+          breakdown: {
+            sms: { b: aggSms.b, c: aggSms.c, i: aggSms.i },
+            msg: { b: aggMsg.b, c: aggMsg.c, i: aggMsg.i }
+          }
+        };
+      }
+      // если в этом файле оба невалидны — идём к следующему файлу (правило «первый найденный»)
+    }
+  }
+  return null;
+}
+
+function parseSheetName(sheetName) {
+  const match = sheetName.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)_(\d{4})$/);
+  if (!match) return null;
+  const months = {
+    "January": 0, "February": 1, "March": 2, "April": 3, "May": 4,
+    "June": 5, "July": 6, "August": 7, "September": 8,
+    "October": 9, "November": 10, "December": 11
+  };
+  return { month: months[match[1]], year: parseInt(match[2]) };
+}
+
+function normalizeNumber(value) {
+  if (typeof value !== 'string') value = value.toString();
+  return parseFloat(value.replace(/\s/g, '').replace(',', '.'));
+}
