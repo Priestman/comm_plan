@@ -1,0 +1,309 @@
+// ====================================================================
+//                           КОНСТАНТЫ
+// ====================================================================
+
+// 1. Ссылка на ОБЩИЙ канал (куда отправляем в 11:00)
+const GENERAL_SLACK_WEBHOOK_URL = "ааааа";
+
+// 2. Ссылка для ЛИЧНЫХ СООБЩЕНИЙ (куда отправляем в 9:00)
+const ADMIN_SLACK_WEBHOOK_URL = "fffff"; 
+
+// Сопоставление имени менеджера и его Slack Member ID
+const STATS_SLACK_MAP = {
+  "Анна": "U09AMHMPDFV",
+  "Богдан": "U08G21NDPJN",
+  "Марат": "U09CF7SHHND",
+  "Наталья": "U09A6Q1MH7T",
+  "Семен": "U095KJFP7L1",
+  "Владислав": "U09CG6HGUMQ"
+};
+
+// Ожидаемые названия столбцов
+const STATS_COLUMN_NAMES = {
+  DATE: "Дата",
+  ROW_CORRECTNESS: "Корректность строки",
+  DISTRIBUTION_STATUS: "Статус рассылки",
+  CHANNEL: "Канал", 
+  PROCESS_LABEL: "process_lable",
+  SENT: "Отправлено",
+  DELIVERED: "Доставлено",
+  SPEND: "Спенд",
+  MANAGER: "Ответственный campaign",
+  SENDER: "Сендер" // <--- ИСПРАВЛЕНО: ищем столбец "Сендер"
+};
+
+// ====================================================================
+//                       ФУНКЦИИ ДЛЯ ТРИГГЕРОВ
+// ====================================================================
+
+// ТРИГГЕР НА 9:00 (Личка)
+function runStatsCheckForAdmin() {
+  checkKPStatsMissing(true); 
+}
+
+// ТРИГГЕР НА 12:00 (Общий канал)
+function runStatsCheckForAll() {
+  checkKPStatsMissing(false); 
+}
+
+// ====================================================================
+//                           ОСНОВНАЯ ЛОГИКА
+// ====================================================================
+
+function checkKPStatsMissing(isAdminMode = false) {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const activeKPs = JSON.parse(scriptProperties.getProperty("active_kps") || "[]");
+  const dateRange = getStatsDateRangeForTuesday(); 
+  const allErrorsByManager = {}; 
+
+  const timeZone = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const startSheetName = Utilities.formatDate(dateRange.start, timeZone, "MMMM_yyyy");
+  const endSheetName = Utilities.formatDate(dateRange.end, timeZone, "MMMM_yyyy");
+  
+  const KPS_TO_SKIP = ["MASS", "EXTERNAL", "CC"];
+
+  Logger.log(`✅ Начинаем проверку. Режим: ${isAdminMode ? "ЛИЧНЫЙ ОТЧЕТ (9:00)" : "ОБЩИЙ КАНАЛ (11:00)"}`);
+
+  const sheetsToCheck = [startSheetName];
+  if (startSheetName !== endSheetName) sheetsToCheck.push(endSheetName);
+
+  for (const kp of activeKPs) {
+    const kpName = kp.name;         
+    const spreadsheetId = kp.id_work; 
+    const normalizedKpName = kpName.trim().toUpperCase();
+    
+    if (KPS_TO_SKIP.includes(normalizedKpName)) continue;
+    if (!spreadsheetId) continue;
+
+    try {
+      for (const sheetName of sheetsToCheck) {
+        findStatsData(spreadsheetId, kpName, dateRange, allErrorsByManager, sheetName); 
+      }
+    } catch (e) {
+      Logger.log(`❌ Ошибка таблицы ${kpName}: ${e.toString()}`);
+    }
+  }
+  
+  sendStatsSlackAlerts(allErrorsByManager, dateRange, isAdminMode); 
+}
+
+// --- Функция поиска данных ---
+function findStatsData(spreadsheetId, kpName, dateRange, allErrorsByManager, sheetName) {
+  const kpSpreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = kpSpreadsheet.getSheetByName(sheetName); 
+  if (!sheet) return;
+  
+  const kpNameUpper = kpName.trim().toUpperCase();
+  const sheetGid = sheet.getSheetId(); 
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+  
+  const headers = data[0];
+  const colIndexes = getStatsColumnIndexes(headers, STATS_COLUMN_NAMES); 
+  const requiredCols = Object.keys(STATS_COLUMN_NAMES);
+  
+  let missingCols = requiredCols.filter(key => colIndexes[key] === undefined);
+  if (kpNameUpper.includes("VIP")) missingCols = missingCols.filter(key => key !== 'MANAGER');
+  
+  // Если не нашли какую-то обязательную колонку (включая Сендер), выходим
+  // Если вы хотите, чтобы скрипт работал даже без колонки "Сендер", удалите проверку ниже или уберите SENDER из requiredCols
+  // Сейчас: если колонки "Сендер" нет -> скрипт пропустит лист.
+  if (missingCols.length > 0) return;
+  
+  const sheetUrl = kpSpreadsheet.getUrl();
+  const isEmpty = (val) => (val === '' || val === null || val === undefined);
+  const isZero = (val) => (typeof val === 'number' && val === 0);
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const dateValue = row[colIndexes.DATE];
+    const managerName = (colIndexes.MANAGER !== undefined && row[colIndexes.MANAGER]) ? row[colIndexes.MANAGER].toString().trim() : 'Неизвестный менеджер';
+    
+    // Считываем значение из колонки "Сендер"
+    const senderValue = (colIndexes.SENDER !== undefined && row[colIndexes.SENDER]) ? row[colIndexes.SENDER].toString().trim() : '';
+
+    // Проверки даты
+    const rowDate = dateValue instanceof Date ? dateValue : null;
+    if (!rowDate || rowDate < dateRange.start || rowDate > dateRange.end) continue;
+
+    const correctness = row[colIndexes.ROW_CORRECTNESS] ? row[colIndexes.ROW_CORRECTNESS].toString().trim() : '';
+    const status = row[colIndexes.DISTRIBUTION_STATUS] ? row[colIndexes.DISTRIBUTION_STATUS].toString().trim() : '';
+    const channel = row[colIndexes.CHANNEL] ? row[colIndexes.CHANNEL].toString().trim() : '';
+    const processLabel = row[colIndexes.PROCESS_LABEL] ? row[colIndexes.PROCESS_LABEL].toString().trim() : '';
+
+    if (status !== "Выполнена" || correctness !== "Перенесено в БД" || (channel !== "SMS" && channel !== "Whatsapp") || !processLabel) continue;
+
+    const sentValue = row[colIndexes.SENT];
+    const deliveredValue = row[colIndexes.DELIVERED];
+    const spendValue = row[colIndexes.SPEND];
+
+    let errorType = null;
+    const allEmpty = isEmpty(sentValue) && isEmpty(deliveredValue) && isEmpty(spendValue);
+    const hasZero = isZero(sentValue) || isZero(deliveredValue) || isZero(spendValue);
+    const hasNonEmptyNonZero = (!isEmpty(sentValue) && !isZero(sentValue)) || (!isEmpty(deliveredValue) && !isZero(deliveredValue)) || (!isEmpty(spendValue) && !isZero(spendValue));
+
+    if (allEmpty) errorType = "MISSING";
+    else if (hasZero && !hasNonEmptyNonZero) errorType = "ZERO";
+    
+    if (!errorType) continue;
+    
+    if (!allErrorsByManager[managerName]) allErrorsByManager[managerName] = [];
+    
+    // Добавляем ошибку в массив
+    allErrorsByManager[managerName].push({
+      kpName: kpName,
+      link: `${sheetUrl}#gid=${sheetGid}&range=A${i + 1}`,
+      rowNumber: i + 1,
+      date: Utilities.formatDate(rowDate, kpSpreadsheet.getSpreadsheetTimeZone(), "dd.MM.yyyy"),
+      processLabel: processLabel,
+      campaignManager: managerName, 
+      sender: senderValue, // Сохраняем отправителя
+      errorType: errorType
+    });
+  }
+}
+
+function getStatsColumnIndexes(headers, requiredColumns) {
+  const indexes = {};
+  const headerMap = {};
+  headers.forEach((header, index) => headerMap[header.toString().trim().toLowerCase()] = index);
+  for (const key in requiredColumns) indexes[key] = headerMap[requiredColumns[key].trim().toLowerCase()];
+  return indexes;
+}
+
+
+/**
+ * ФОРМИРОВАНИЕ И ОТПРАВКА
+ */
+function sendStatsSlackAlerts(allErrorsByManager, dateRange, isAdminMode) {
+  const allManagersWithErrors = Object.keys(allErrorsByManager).filter(manager => allErrorsByManager[manager].length > 0);
+  const timeZone = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const period = `${Utilities.formatDate(dateRange.start, timeZone, "dd.MM.yyyy")} - ${Utilities.formatDate(dateRange.end, timeZone, "dd.MM.yyyy")}`;
+  
+  // Определяем URL
+  const webhookUrl = isAdminMode ? ADMIN_SLACK_WEBHOOK_URL : GENERAL_SLACK_WEBHOOK_URL;
+
+  // 1. Если ошибок нет
+  if (allManagersWithErrors.length === 0) {
+    if (isAdminMode) {
+        sendStatsSlackMessage(webhookUrl, { text: `🛡️ *[ПРОВЕРКА 9:00]* Все чисто! Просроченной статистики нет.` });
+    } else {
+        sendStatsSlackMessage(webhookUrl, { text: `:white_check_mark: *Статистика по коммуникациям за период заполнена в полном объеме* (период: ${period})` });
+    }
+    return;
+  }
+  
+  // 2. Если режим Админа — сначала отправляем "Сводку"
+  if (isAdminMode) {
+      const summaryText = `🛡️ *[ПРЕДВАРИТЕЛЬНЫЙ ОТЧЕТ]*\nПериод: ${period}\nНайдены ошибки у менеджеров (${allManagersWithErrors.length}): *${allManagersWithErrors.join(', ')}*\n_Ниже детальная разбивка:_`;
+      sendStatsSlackMessage(webhookUrl, { text: summaryText });
+  }
+
+  // 3. Отправляем детальные сообщения
+  for (const managerName of allManagersWithErrors) {
+    const errors = allErrorsByManager[managerName];
+    
+    let header = "";
+    if (isAdminMode) {
+        header = `👤 *Менеджер: ${managerName}*`;
+    } else {
+        const slackId = STATS_SLACK_MAP[managerName]; 
+        const mention = slackId ? `<@${slackId}>` : `*${managerName}*`;
+        header = `${mention} 🚨 *Просрочена статистика* по коммуникациям за период *${period}*.`;
+    }
+
+    let messageText = header + "\n\n"; 
+    
+    const missingErrors = errors.filter(e => e.errorType === 'MISSING');
+    const zeroErrors = errors.filter(e => e.errorType === 'ZERO');
+
+    // Блок с пустыми данными
+    if (missingErrors.length > 0) {
+        messageText += `:red_circle: *Нет статистики по отправкам (все поля пустые):*\n`;
+        missingErrors.forEach((err, index) => {
+             let errorLine = `${index + 1}. *КП:* ${err.kpName}, *Дата:* ${err.date}, <${err.link}|Строка ${err.rowNumber}>`;
+             
+             if (err.processLabel) errorLine += `, *PL:* \`${err.processLabel}\``;
+             
+             // ВЫВОД: Сендер (Resp удален)
+             if (err.sender) errorLine += `, *Sender:* \`${err.sender}\``;
+             
+             errorLine += `, *Ошибка:* \`нет данных Отправлено, Доставлено, Спенд\``;
+             messageText += errorLine + '\n';
+        });
+        messageText += "\n";
+    }
+
+    // Блок с нулями
+    if (zeroErrors.length > 0) {
+        messageText += `:large_yellow_circle: *Нулевая статистика по отправкам (есть нули):*\n`;
+        zeroErrors.forEach((err, index) => {
+             let errorLine = `${index + 1}. *КП:* ${err.kpName}, *Дата:* ${err.date}, <${err.link}|Строка ${err.rowNumber}>`;
+             
+             if (err.processLabel) errorLine += `, *PL:* \`${err.processLabel}\``;
+             
+             // ВЫВОД: Сендер (Resp удален)
+             if (err.sender) errorLine += `, *Sender:* \`${err.sender}\``;
+             
+             errorLine += `, *Ошибка:* \`нулевая статистика по отправкам\``;
+             messageText += errorLine + '\n';
+        });
+    }
+
+    // Отправляем сообщение по конкретному менеджеру
+    sendStatsSlackMessage(webhookUrl, { text: messageText });
+    
+    Utilities.sleep(300); 
+  }
+}
+
+/**
+ * Отправка в Slack по конкретному URL
+ */
+function sendStatsSlackMessage(webhookUrl, payload) {
+  try {
+    const options = {
+      'method' : 'post',
+      'contentType': 'application/json',
+      'payload' : JSON.stringify(payload)
+    };
+    UrlFetchApp.fetch(webhookUrl, options); 
+    Logger.log("✅ Сообщение отправлено.");
+  } catch (e) {
+    Logger.log(`❌ Ошибка отправки: ${e.toString()}`);
+  }
+}
+
+function getStatsDateRangeForTuesday() {
+  const today = new Date();
+  const timeZone = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const currentMonth = today.getMonth();
+  const dayOfWeek = today.getDay(); 
+
+  const daysSinceLastSunday = dayOfWeek === 0 ? 7 : dayOfWeek;
+  const lastSunday = new Date(today);
+  lastSunday.setDate(today.getDate() - daysSinceLastSunday);
+  const formattedEnd = Utilities.formatDate(lastSunday, timeZone, "yyyy-MM-dd");
+  const end = new Date(formattedEnd + "T23:59:59"); 
+
+  let start;
+  let daysUntilNextTuesday = (2 + 7 - dayOfWeek) % 7;
+  if (daysUntilNextTuesday === 0) daysUntilNextTuesday = 7; 
+  const nextTuesday = new Date(today);
+  nextTuesday.setDate(today.getDate() + daysUntilNextTuesday);
+  
+  if (nextTuesday.getMonth() !== currentMonth) {
+    const firstDayOfMonth = new Date(today.getFullYear(), currentMonth, 1);
+    start = new Date(Utilities.formatDate(firstDayOfMonth, timeZone, "yyyy-MM-dd") + "T00:00:00"); 
+  } else {
+    const lastMonday = new Date(lastSunday);
+    lastMonday.setDate(lastSunday.getDate() - 6);
+    if (lastMonday.getMonth() !== currentMonth) {
+        const prevMonth = new Date(today.getFullYear(), currentMonth - 1, 1);
+        start = new Date(Utilities.formatDate(prevMonth, timeZone, "yyyy-MM-dd") + "T00:00:00"); 
+    } else {
+        start = new Date(Utilities.formatDate(lastMonday, timeZone, "yyyy-MM-dd") + "T00:00:00"); 
+    }
+  }
+  return { start, end };
+}
