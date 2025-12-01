@@ -1,0 +1,56 @@
+function applyDropdownsToKPFiles() {
+  const SP = PropertiesService.getScriptProperties();
+  const activeKPs = JSON.parse(SP.getProperty('active_kps') || '[]');
+  const themeSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('theme');
+  if (!themeSheet) throw new Error('Лист theme не найден');
+
+  const headers = ['GENERAL', 'SUBJECT', 'TYPE'];
+  const headerColumnIndex = { GENERAL: 0, SUBJECT: 1, TYPE: 2 }; // 0-based
+
+  // Получаем уникальные значения по каждому столбцу из theme
+  const themeData = themeSheet.getDataRange().getValues().slice(1);
+  const dropdowns = {};
+  headers.forEach(header => {
+    const colIdx = headerColumnIndex[header];
+    const values = [...new Set(themeData.map(row => row[colIdx]).filter(v => v !== ''))];
+    dropdowns[header] = values;
+  });
+
+  const now = new Date();
+  const timeZone = Session.getScriptTimeZone();
+  const currentMonth = Utilities.formatDate(now, timeZone, 'MMMM_yyyy');
+  const nextMonth = Utilities.formatDate(new Date(now.getFullYear(), now.getMonth() + 1, 1), timeZone, 'MMMM_yyyy');
+  const monthsToProcess = [currentMonth, nextMonth];
+
+  const monthRegex = /^[A-Z][a-z]+_\d{4}$/; // Шаблон: July_2025
+
+  activeKPs.forEach(kp => {
+    try {
+      const file = SpreadsheetApp.openById(kp.id_work);
+      const sheets = file.getSheets();
+
+      sheets.forEach(sheet => {
+        const sheetName = sheet.getName();
+        if (!monthRegex.test(sheetName)) return; // Пропускаем если не по шаблону
+        if (!monthsToProcess.includes(sheetName)) return;
+
+        const headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        headers.forEach(header => {
+          const colIndex = headerRow.indexOf(header);
+          if (colIndex === -1) return; // Столбец отсутствует
+
+          const range = sheet.getRange(2, colIndex + 1, sheet.getMaxRows() - 1);
+          const rule = SpreadsheetApp.newDataValidation()
+            .requireValueInList(dropdowns[header], true)
+            .setAllowInvalid(false)
+            .build();
+          range.setDataValidation(rule);
+        });
+      });
+    } catch (e) {
+      Logger.log(`❌ Ошибка в КП ${kp.name}: ${e.message}`);
+    }
+  });
+
+  Logger.log('✅ Выпадающие списки применены');
+}
