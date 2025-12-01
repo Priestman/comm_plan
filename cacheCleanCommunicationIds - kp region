@@ -1,0 +1,72 @@
+function cacheCleanCommunicationIds() {
+  const cleanFileId = '1WfslprOxh0UTQhkr1qjTRIEeTG56moyAlAK3NAnffrg';
+  const timeZone = Session.getScriptTimeZone();
+
+  const now = new Date();
+  const currentMonth = Utilities.formatDate(now, timeZone, "MMMM_yyyy");
+  const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const previousMonth = Utilities.formatDate(prevDate, timeZone, "MMMM_yyyy");
+
+  const monthsToKeep = new Set([currentMonth, previousMonth]);
+  const properties = PropertiesService.getScriptProperties();
+
+  [currentMonth, previousMonth].forEach(month => {
+    const sheet = SpreadsheetApp.openById(cleanFileId).getSheetByName(month);
+    if (!sheet) {
+      Logger.log(`⚠️ Лист '${month}' не найден — пропущен.`);
+      return;
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const idCol = headers.indexOf("communication_id") + 1;
+    const trackCol = headers.indexOf("Трек") + 1;
+    const dateCol = headers.indexOf("moving_date") + 1;
+
+    if (idCol < 1 || trackCol < 1 || dateCol < 1) {
+      Logger.log(`❌ Не найдены обязательные столбцы в '${month}'.`);
+      return;
+    }
+
+    const numRows = sheet.getLastRow() - 1;
+    if (numRows < 1) {
+      Logger.log(`⚠️ Нет данных в листе '${month}' для кэширования.`);
+      return;
+    }
+
+    const data = sheet.getRange(2, 1, numRows, sheet.getLastColumn()).getValues();
+    const cache = {};
+
+    data.forEach(row => {
+      const id = row[idCol - 1]?.toString().trim();
+      const track = row[trackCol - 1]?.toString().trim();
+
+      let dateCell = row[dateCol - 1];
+      let formattedDate = "";
+      if (Object.prototype.toString.call(dateCell) === "[object Date]") {
+        formattedDate = Utilities.formatDate(dateCell, timeZone, "dd.MM.yyyy HH:mm:ss");
+      } else {
+        formattedDate = dateCell?.toString().trim();
+      }
+
+      if (!id || !track || !formattedDate) return;
+      cache[id] = { track, date: formattedDate };
+    });
+
+    properties.setProperty(`clean_ids_${month}`, JSON.stringify(cache));
+    Logger.log(`✅ Кэшировано ${Object.keys(cache).length} ID в clean_ids_${month}`);
+  });
+
+  // 🧹 Удаление устаревших переменных
+  const allProps = properties.getProperties();
+  Object.keys(allProps).forEach(key => {
+    if (key.startsWith("clean_ids_")) {
+      const monthKey = key.replace("clean_ids_", "");
+      if (!monthsToKeep.has(monthKey)) {
+        properties.deleteProperty(key);
+        Logger.log(`🗑 Удалена устаревшая переменная: ${key}`);
+      }
+    }
+  });
+
+  Logger.log("🎯 Кэш обновлён. Храним только текущий и предыдущий месяц.");
+}
