@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 15px;
+        background-color: #f8f9fa;
+      }
+      
+      .header {
+        background: linear-gradient(135deg, #4285f4, #34a853);
+        color: white;
+        padding: 15px;
+        margin: -15px -15px 20px -15px;
+        text-align: center;
+        font-size: 18px;
+        font-weight: bold;
+      }
+      
+      .section {
+        background: white;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      }
+      
+      .btn {
+        background: #4285f4;
+        color: white;
+        border: none;
+        padding: 12px 20px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        width: 100%;
+        margin: 10px 0;
+        transition: background 0.3s;
+      }
+      
+      .btn:hover {
+        background: #3367d6;
+      }
+      
+      .btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      
+      .log-container {
+        background: #f5f5f5;
+        border-radius: 6px;
+        padding: 15px;
+        margin-top: 15px;
+        max-height: 300px;
+        overflow-y: auto;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        border-left: 4px solid #4285f4;
+      }
+      
+      .log-entry {
+        margin: 3px 0;
+        padding: 2px 0;
+      }
+      
+      .log-success { color: #137333; }
+      .log-warning { color: #ea4335; }
+      .log-info { color: #1976d2; }
+      .log-error { color: #d93025; font-weight: bold; }
+      
+      .spinner {
+        border: 3px solid #f3f3f3;
+        border-top: 3px solid #4285f4;
+        border-radius: 50%;
+        width: 30px;
+        height: 30px;
+        animation: spin 1s linear infinite;
+        margin: 10px auto;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      
+      .status {
+        padding: 10px;
+        border-radius: 6px;
+        margin: 10px 0;
+        text-align: center;
+        font-weight: bold;
+      }
+      
+      .status-success {
+        background: #e6f4ea;
+        color: #137333;
+        border: 1px solid #34a853;
+      }
+      
+      .status-error {
+        background: #fce8e6;
+        color: #d93025;
+        border: 1px solid #ea4335;
+      }
+    </style>
+  </head>
+  
+  <body>
+    <div class="header">
+      📋 Обновление выпадающих списков
+    </div>
+    
+    <div class="section">
+      <h3 style="margin-top: 0;">Управление</h3>
+      <button class="btn" onclick="startUpdate()" id="updateBtn">
+        🔄 Обновить все списки
+      </button>
+      <button class="btn" onclick="checkUniqueness()" id="uniqueBtn">
+        ✅ Проверить уникальность
+      </button>
+      <button class="btn" onclick="showStatistics()" id="statsBtn">
+        📊 Показать статистику
+      </button>
+    </div>
+    
+    <div class="section">
+      <h3 style="margin-top: 0;">📝 Логи выполнения</h3>
+      <div id="status"></div>
+      <div id="logs" class="log-container" style="display: none;">
+        <div id="logEntries"></div>
+      </div>
+    </div>
+
+    <script>
+      let isRunning = false;
+      
+      function startUpdate() {
+        if (isRunning) return;
+        
+        setRunning(true);
+        showStatus('Запуск обновления...', 'info');
+        clearLogs();
+        
+        google.script.run
+          .withSuccessHandler(onUpdateSuccess)
+          .withFailureHandler(onUpdateFailure)
+          .runUpdateValidationLists();
+      }
+      
+      function checkUniqueness() {
+        if (isRunning) return;
+        
+        setRunning(true);
+        showStatus('Проверка уникальности...', 'info');
+        clearLogs();
+        
+        google.script.run
+          .withSuccessHandler(onUniquenessSuccess)
+          .withFailureHandler(onUniquenessFailure)
+          .checkUniqueness();
+      }
+      
+      function showStatistics() {
+        google.script.run.showStatistics();
+      }
+      
+      function onUpdateSuccess(logs) {
+        setRunning(false);
+        showStatus('✅ Обновление завершено успешно!', 'success');
+        displayLogs(logs);
+      }
+      
+      function onUpdateFailure(error) {
+        setRunning(false);
+        showStatus('❌ Ошибка выполнения: ' + error.message, 'error');
+      }
+      
+      function onUniquenessSuccess(logs) {
+        setRunning(false);
+        showStatus('✅ Проверка завершена', 'success');
+        displayLogs(logs);
+      }
+      
+      function onUniquenessFailure(error) {
+        setRunning(false);
+        showStatus('❌ Ошибка проверки: ' + error.message, 'error');
+      }
+      
+      function setRunning(running) {
+        isRunning = running;
+        const buttons = ['updateBtn', 'uniqueBtn', 'statsBtn'];
+        
+        buttons.forEach(btnId => {
+          const btn = document.getElementById(btnId);
+          btn.disabled = running;
+        });
+        
+        if (running) {
+          document.getElementById('status').innerHTML = 
+            '<div class="spinner"></div><div>Выполнение...</div>';
+        }
+      }
+      
+      function showStatus(message, type) {
+        const statusDiv = document.getElementById('status');
+        let className = 'status';
+        
+        if (type === 'success') className += ' status-success';
+        else if (type === 'error') className += ' status-error';
+        
+        statusDiv.innerHTML = `<div class="${className}">${message}</div>`;
+      }
+      
+      function clearLogs() {
+        document.getElementById('logEntries').innerHTML = '';
+        document.getElementById('logs').style.display = 'none';
+      }
+      
+      function displayLogs(logs) {
+        const logEntries = document.getElementById('logEntries');
+        const logsContainer = document.getElementById('logs');
+        
+        logEntries.innerHTML = '';
+        
+        logs.forEach(log => {
+          const entry = document.createElement('div');
+          entry.className = 'log-entry';
+          
+          // Определяем тип лога для стилизации
+          if (log.includes('✅')) entry.className += ' log-success';
+          else if (log.includes('⚠️') || log.includes('❌')) entry.className += ' log-warning';
+          else if (log.includes('🔍') || log.includes('📅')) entry.className += ' log-info';
+          else if (log.includes('ОШИБКА ') || log.includes('ERROR')) entry.className += ' log-error';
+          
+          entry.textContent = log;
+          logEntries.appendChild(entry);
+        });
+        
+        logsContainer.style.display = 'block';
+        
+        // Автоскролл вниз
+        setTimeout(() => {
+          logEntries.scrollTop = logEntries.scrollHeight;
+        }, 100);
+      }
+      
+      // Инициализация
+      document.addEventListener('DOMContentLoaded', function() {
+        showStatus('Готово к работе', 'success');
+      });
+    </script>
+  </body>
+</html>
